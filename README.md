@@ -41,7 +41,7 @@ Follow these instructions to get the project running on your local machine for d
 
 1.  **Clone the repository**:
     ```bash
-    git clone <your-repository-url>
+    git clone https://github.com/NoAdsInside/GuitarTuner.git
     cd guitarTuner 
     ```
     (Replace `<your-repository-url>` with the actual URL of your GitHub repository)
