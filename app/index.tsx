@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
-import { View, StyleSheet, Button, Alert, Text, TouchableOpacity, Platform, LayoutChangeEvent, SafeAreaView } from 'react-native';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { View, StyleSheet, Button, Alert, Text, TouchableOpacity, Platform, LayoutChangeEvent, SafeAreaView, Modal, Pressable } from 'react-native';
 import { AudioModule } from 'expo-audio'; // For permissions
 import Pitchy, { PitchyConfig, PitchyEventCallback } from 'react-native-pitchy';
 import RNSoundLevel from 'react-native-sound-level'; // Import RNSoundLevel
 import FrequencyVisualizer from './FrequencyVisualizer'; // Import the new component
+import SettingsScreen from './SettingsScreen'; // Import SettingsScreen
 
 const allPossibleNotes = ["C", "C♯/D♭", "D", "D♯/E♭", "E", "F", "F♯/G♭", "G", "G♯/A♭", "A", "A♯/B♭", "B"];
 const noteBaseNames = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]; // For naming convention
@@ -27,48 +28,36 @@ const noteFrequencyTable = [
   [30.87, 61.74, 123.47, 246.94, 493.88, 987.77], // B
 ];
 
-// Create a flat list of { noteNameWithOctave: string, frequency: number }
-const detailedNoteFrequencies: { noteNameWithOctave: string; frequency: number }[] = [];
-noteFrequencyTable.forEach((octaveFrequencies, noteIndex) => {
-  const baseName = noteBaseNames[noteIndex];
-  octaveFrequencies.forEach((freq, octave) => {
-    detailedNoteFrequencies.push({
-      noteNameWithOctave: `${baseName}${octave}`,
-      frequency: freq,
-    });
-  });
-});
+// Interface for detailed note structure
+interface DetailedNote {
+  noteNameWithOctave: string;
+  frequency: number;
+}
 
-// const originalLeftIndices = [2, 1, 0]; // No longer needed
-// const originalRightIndices = [3, 4, 5]; // No longer needed
+// Original detailedNoteFrequencies generation logic is removed from here
+// It will be handled by a useEffect hook based on visualizerSensitivity
 
 const MIN_GUITAR_FREQUENCY = 30; // Minimum frequency to consider for guitar tuning (approx Low B0)
 const MAX_GUITAR_FREQUENCY = 1300; // Maximum frequency to consider for guitar tuning
-const MIN_VISUALIZATION_VOLUME = -45; // dBFS: Minimum volume for a sound to be processed and visualized.
 
-function frequencyToNote(frequency: number): string | null {
-  if (frequency <= 0) return null;
-
-  let closestNote: string | null = null;
-  let minDifference = Infinity;
-
-  for (const noteInfo of detailedNoteFrequencies) {
-    const difference = Math.abs(noteInfo.frequency - frequency);
-    if (difference < minDifference) {
-      minDifference = difference;
-      closestNote = noteInfo.noteNameWithOctave;
-    }
-    // Optimization: if the table frequencies are sorted, we can stop early
-    // once differences start increasing, but a full scan is safer for unsorted/small tables.
-    // Also, consider a tolerance: if diff is very small, it's a good match.
-    // For now, just find the absolute closest.
-  }
-  return closestNote;
-}
+// Create a memoized list of standard (unrounded) note frequencies
+// This ensures the target frequencies for notes are their true musical values,
+// unaffected by the visualizerSensitivity setting which only controls display scaling.
+const getStandardNoteFrequencies = (): DetailedNote[] => {
+  const notes: DetailedNote[] = [];
+  noteFrequencyTable.forEach((octaveFrequencies, noteIndex) => {
+    const baseName = noteBaseNames[noteIndex];
+    octaveFrequencies.forEach((freq, octave) => {
+      notes.push({
+        noteNameWithOctave: `${baseName}${octave}`,
+        frequency: freq, // Use the direct, unrounded frequency
+      });
+    });
+  });
+  return notes;
+};
 
 export default function App() {
-  const [isChromaticMode, setIsChromaticMode] = useState(true);
-  // const [tuningNotes, setTuningNotes] = useState(['E', 'A', 'D', 'G', 'B', 'E']); // No longer needed
   const [currentFrequency, setCurrentFrequency] = useState<number | null>(null);
   const [detectedNote, setDetectedNote] = useState<string | null>(null);
   const [targetFrequency, setTargetFrequency] = useState<number | null>(null); // For the visualizer
@@ -78,136 +67,300 @@ export default function App() {
   const pitchyStartedRef = useRef(false); // To track if Pitchy started
   const soundLevelStartedRef = useRef(false); // To track if RNSoundLevel started
 
+  // Settings State
+  const [settingsModalVisible, setSettingsModalVisible] = useState(false);
+  const [noiseThreshold, setNoiseThreshold] = useState(-45); // Default noise threshold
+  const [visualizerSensitivity, setVisualizerSensitivity] = useState(5); // Default visualizer sensitivity
+
+  // Ref for noiseThreshold to be used in callbacks within useEffect
+  const noiseThresholdRef = useRef(noiseThreshold);
+  useEffect(() => {
+      noiseThresholdRef.current = noiseThreshold;
+  }, [noiseThreshold]);
+
+  // State for sensitivity-adjusted note frequencies
+  const [currentDetailedNoteFrequencies, setCurrentDetailedNoteFrequencies] = useState<DetailedNote[]>([]);
+
+  // Effect to recalculate detailedNoteFrequencies when visualizerSensitivity changes
+  useEffect(() => {
+    const newDetailedNotes: DetailedNote[] = [];
+    const sensitivity = Math.max(0.01, visualizerSensitivity);
+    noteFrequencyTable.forEach((octaveFrequencies, noteIndex) => {
+      const baseName = noteBaseNames[noteIndex];
+      octaveFrequencies.forEach((freq, octave) => {
+        const roundedFreq = Math.round(freq / sensitivity) * sensitivity;
+        newDetailedNotes.push({
+          noteNameWithOctave: `${baseName}${octave}`,
+          frequency: roundedFreq,
+        });
+      });
+    });
+    setCurrentDetailedNoteFrequencies(newDetailedNotes);
+  }, [visualizerSensitivity]);
+
+  // Callback to convert frequency to note using currentDetailedNoteFrequencies
+  // currentDetailedNoteFrequencies uses sensitivity-rounded frequencies to determine note "bins".
+  const frequencyToNote = useCallback((frequency: number): string | null => {
+    if (frequency <= 0 || currentDetailedNoteFrequencies.length === 0) return null;
+
+    let closestNote: string | null = null;
+    let minDifference = Infinity;
+
+    for (const noteInfo of currentDetailedNoteFrequencies) {
+      const difference = Math.abs(noteInfo.frequency - frequency);
+      if (difference < minDifference) {
+        minDifference = difference;
+        closestNote = noteInfo.noteNameWithOctave;
+      }
+    }
+    return closestNote;
+  }, [currentDetailedNoteFrequencies]);
+
+  // Ref to hold the latest frequencyToNote callback
+  const frequencyToNoteRef = useRef(frequencyToNote);
+  useEffect(() => {
+    frequencyToNoteRef.current = frequencyToNote;
+  }, [frequencyToNote]);
+
   // Effect to update targetFrequency when detectedNote changes
+  // It uses standardNoteFrequencies to get the true target for the visualizer.
+  const standardNoteFrequencies = useMemo(() => getStandardNoteFrequencies(), []);
+
   useEffect(() => {
     if (detectedNote) {
-      const noteInfo = detailedNoteFrequencies.find(nf => nf.noteNameWithOctave === detectedNote);
+      const noteInfo = standardNoteFrequencies.find(nf => nf.noteNameWithOctave === detectedNote);
       if (noteInfo) {
-        setTargetFrequency(noteInfo.frequency);
+        setTargetFrequency(noteInfo.frequency); // This frequency is now the STANDARD, UNROUNDED one
       } else {
-        setTargetFrequency(null); // Or handle if note not in table, though it should be
+        console.warn(`Detected note ${detectedNote} not found in standardNoteFrequencies.`);
+        setTargetFrequency(null); 
       }
     } else {
       setTargetFrequency(null);
     }
-  }, [detectedNote]);
+  }, [detectedNote, standardNoteFrequencies]);
 
+  // Effect for one-time Pitchy initialization
+  const [isPitchyInitialized, setIsPitchyInitialized] = useState(false); // New state for init tracking
+  useEffect(() => {
+    console.log('Attempting Pitchy.init()...');
+    const pitchyConfig: PitchyConfig = { minVolume: -50 }; 
+    try {
+      const initPromise = Pitchy.init(pitchyConfig);
+      if (initPromise && typeof initPromise.then === 'function') {
+        initPromise
+          .then(() => {
+            console.log('Pitchy.init() successful.');
+            setIsPitchyInitialized(true);
+          })
+          .catch((e: any) => {
+            console.error('Pitchy.init() failed (promise catch):', e);
+            setIsPitchyInitialized(false); // Explicitly set to false on error
+          });
+      } else {
+        setIsPitchyInitialized(true); // Optimistic if no promise, but check lib behavior
+      }
+    } catch (e: any) {
+      console.error('Error calling Pitchy.init() (try-catch block):', e);
+      setIsPitchyInitialized(false);
+    }
+    // No cleanup needed for init itself, but if it had a specific deinit, it would go here.
+  }, []);
+
+  // Main audio processing effect
   useEffect(() => {
     let isMounted = true;
     let pitchSubscription: { remove: () => void } | null = null;
 
+    // Guard: Do not proceed if Pitchy is not yet initialized.
+    if (!isPitchyInitialized) {
+      console.log('Main audio effect: Pitchy not initialized, skipping setup.');
+      return; // Wait for Pitchy to be initialized
+    }
+
     const setupAudioProcessing = async () => {
+      // Artificial delay to allow native modules to settle after potential stop from cleanup
+      await new Promise(resolve => setTimeout(resolve, 250)); 
+      if (!isMounted) {
+          // console.log("setupAudioProcessing: Unmounted during initial delay. Aborting setup.");
+          return;
+      }
+      // console.log('setupAudioProcessing: Starting audio services after delay.');
+
+      // pitchyStartedRef.current = false; // These are set after conditional stops
+      // soundLevelStartedRef.current = false;
+
       try {
-        // 1. Request Permissions
+        // console.log('setupAudioProcessing: Pre-emptive stop of audio services...');
+        if (pitchyStartedRef.current) {
+          try {
+            const stopPitchyPromise = Pitchy.stop();
+            if (stopPitchyPromise && typeof stopPitchyPromise.then === 'function') {
+              await stopPitchyPromise;
+
+            } else {
+              // console.warn('setupAudioProcessing: Pitchy.stop() did not return a promise (pre-emptive).');
+            }
+          } catch (e:any) {
+            // console.warn('setupAudioProcessing: Error during pre-emptive Pitchy.stop() (when ref was true):', e);
+          }
+        } else {
+          // console.log('setupAudioProcessing: Pre-emptive Pitchy.stop() skipped as pitchyStartedRef was false.');
+        }
+        pitchyStartedRef.current = false; // Reset ref before new start attempt
+
+        if (soundLevelStartedRef.current) {
+          RNSoundLevel.stop();
+          // console.log('setupAudioProcessing: Pre-emptive RNSoundLevel.stop() called.');
+        } else {
+          // console.log('setupAudioProcessing: Pre-emptive RNSoundLevel.stop() skipped as soundLevelStartedRef was false.');
+        }
+        soundLevelStartedRef.current = false; // Reset ref before new start attempt
+        // console.log('setupAudioProcessing: Pre-emptive stop completed.');
+
+        if (!isMounted) return;
+
         const permissionStatus = await AudioModule.requestRecordingPermissionsAsync();
         if (!permissionStatus.granted) {
           if (isMounted) Alert.alert('Permission Denied', 'Microphone permission is required.');
           return;
         }
+        // console.log('setupAudioProcessing: Microphone permissions granted.');
 
-        // 2. Initialize Pitchy with a new minVolume
-        const pitchyConfig: PitchyConfig = {
-          minVolume: -50, // Adjusted from -60. Should be slightly more sensitive than MIN_VISUALIZATION_VOLUME.
-        };
-        await Pitchy.init(pitchyConfig);
-        console.log('Pitchy initialized with config:', pitchyConfig);
+        if (!isMounted) return;
 
-        // 3. Setup RNSoundLevel
         RNSoundLevel.onNewFrame = (data) => {
           if (isMounted) {
             const newVolume = data.value;
+            // console.log(`RNSoundLevel Frame: Volume=${newVolume.toFixed(2)}, NoiseThreshold=${noiseThresholdRef.current.toFixed(2)}`); // DEBUG LOG
             setVolume(newVolume);
-            volumeRef.current = newVolume; // Update ref here
-            // console.log('Sound Level (dBFS):', newVolume);
-            if (newVolume < MIN_VISUALIZATION_VOLUME) {
-              // If volume is too low, clear frequency and note regardless of Pitchy's output
+            volumeRef.current = newVolume;
+            if (newVolume < noiseThresholdRef.current) {
+              // console.log('RNSoundLevel: Volume below threshold, clearing frequency/note.'); // DEBUG LOG
               setCurrentFrequency(null);
               setDetectedNote(null);
             }
-            // If volume is sufficient, Pitchy's listener will set frequency/note
           }
         };
-        RNSoundLevel.start(); // Default monitor interval is 250ms
-        soundLevelStartedRef.current = true; // Mark as started
-        console.log('RNSoundLevel started.');
+        RNSoundLevel.start();
+        soundLevelStartedRef.current = true;
+        // console.log('setupAudioProcessing: RNSoundLevel started.');
 
-        // 4. Add Listener
-        const handlePitchDetected: PitchyEventCallback = (data) => {
-          // console.log('Pitchy event data:', data); // Keep this for debugging if needed
-          
-          // Only process pitch if volume is currently sufficient (use ref here)
-          if (isMounted && volumeRef.current !== null && volumeRef.current >= MIN_VISUALIZATION_VOLUME) {
-            if (data && data.pitch != null) {
-              if (data.pitch >= MIN_GUITAR_FREQUENCY && data.pitch <= MAX_GUITAR_FREQUENCY) {
-                setCurrentFrequency(data.pitch);
-                setDetectedNote(frequencyToNote(data.pitch));
-              } else {
-                // Frequency out of guitar range, treat as no valid note for display
-                setCurrentFrequency(null);
-                setDetectedNote(null);
-              }
-            } else {
-              // Pitchy reported no pitch, clear display (if not already cleared by volume)
-              // setCurrentFrequency(null); 
-              // setDetectedNote(null);
+        if (!isMounted) return;
+
+        try {
+          // console.log('setupAudioProcessing: Attempting Pitchy.start()...');
+          const startPromise = Pitchy.start();
+          if (startPromise && typeof startPromise.then === 'function') {
+            await startPromise;
+            // console.log('setupAudioProcessing: Pitchy.start() resolved.');
+          } else {
+            // console.warn('setupAudioProcessing: Pitchy.start() did not return a promise (assuming sync success).');
+            // If sync and fails, it should throw, to be caught by the catch block.
+          }
+          pitchyStartedRef.current = true; // Mark as started
+
+          if (!isMounted) { // Check again after await/potential sync operation
+            if (pitchyStartedRef.current) { // If we thought it started
+                try { Pitchy.stop(); } catch (e) { /* console.warn("Error stopping Pitchy due to unmount after start", e); */ }
             }
-          } else if (isMounted) {
-            // Volume is too low (or null initially), ensure display is clear
-            // This case might be redundant if RNSoundLevel.onNewFrame already cleared them,
-            // but it's a good safeguard if Pitchy fires before RNSoundLevel on a quiet signal.
-            // setCurrentFrequency(null); // RNSoundLevel.onNewFrame handles this primarily.
-            // setDetectedNote(null);
+            pitchyStartedRef.current = false;
+            return; // Important: exit if unmounted
           }
-        };
-        pitchSubscription = Pitchy.addListener(handlePitchDetected);
 
-        // 5. Start Pitch Detection
-        await Pitchy.start();
-        pitchyStartedRef.current = true; // Mark as started
-        if (isMounted) {
-          console.log('Pitch detection started successfully.');
+          // Add listener only after successful start and if still mounted
+          pitchSubscription = Pitchy.addListener((data) => {
+            // console.log(`Pitchy Data: Pitch=${data?.pitch?.toFixed(2)}, VolumeRef=${volumeRef.current?.toFixed(2)}, NoiseThreshold=${noiseThresholdRef.current.toFixed(2)}`); // DEBUG LOG
+            if (isMounted && volumeRef.current !== null && volumeRef.current >= noiseThresholdRef.current) {
+              if (data && data.pitch != null) {
+                if (data.pitch >= MIN_GUITAR_FREQUENCY && data.pitch <= MAX_GUITAR_FREQUENCY) {
+                  // console.log('Pitchy: Valid pitch detected and above threshold.'); // DEBUG LOG
+                  setCurrentFrequency(data.pitch);
+                  setDetectedNote(frequencyToNoteRef.current(data.pitch)); // Use ref here
+                } else {
+                  // console.log('Pitchy: Pitch out of guitar range.'); // DEBUG LOG
+                  setCurrentFrequency(null);
+                  setDetectedNote(null);
+                }
+              } 
+            } 
+          });
+          // console.log('setupAudioProcessing: Pitchy listener added AFTER Pitchy.start().');
+        
+          // if (isMounted) console.log('setupAudioProcessing: Pitch detection started successfully.');
+
+        } catch (error: any) {
+          // console.error('setupAudioProcessing: Error during Pitchy.start() or addListener():', error);
+          if (isMounted) Alert.alert('Audio Processing Error', 'Could not start Pitchy: ' + error.message);
+          
+          // Cleanup if error occurred
+          if (pitchSubscription) { // If listener was somehow assigned before error
+            pitchSubscription.remove();
+            pitchSubscription = null;
+          }
+          if (pitchyStartedRef.current) { // If start was marked true but something after failed
+            try { Pitchy.stop(); } catch (e) { /* console.warn("Error stopping Pitchy in start/addListener error handler", e); */ }
+          }
+          pitchyStartedRef.current = false;
+          
+          // Also stop RNSoundLevel if Pitchy setup fails
+          if (soundLevelStartedRef.current) {
+              RNSoundLevel.stop();
+              soundLevelStartedRef.current = false;
+          }
+          return; // Exit setupAudioProcessing
         }
-
-      } catch (error) {
-        console.error('Error setting up or starting audio processing:', error);
-        if (isMounted) Alert.alert('Audio Processing Error', 'Could not start audio processing.');
+        
+      } catch (error: any) {
+        // console.error('setupAudioProcessing: Outer error - Error setting up or starting audio processing:', error);
+        if (isMounted) Alert.alert('Audio Processing Error', 'Could not start audio processing: ' + error.message);
       }
     };
 
-    setupAudioProcessing();
+    if (isMounted) {
+      setupAudioProcessing();
+    }
 
     return () => {
       isMounted = false;
-      console.log('Cleaning up audio processing...');
+      // console.log('Cleaning up audio processing (main effect)...');
       if (pitchSubscription) {
         pitchSubscription.remove();
-        console.log('Pitch listener removed.');
+        pitchSubscription = null;
+        // console.log('Pitch listener removed.');
       }
       
       if (pitchyStartedRef.current) {
-        Pitchy.stop().then(() => {
-          console.log('Pitch detection stopped successfully.');
-        }).catch(error => {
-          console.error('Error stopping pitch detection:', error);
-        }).finally(() => {
-          pitchyStartedRef.current = false; // Ensure it's marked as stopped
-        });
+        // console.log('Attempting to stop Pitchy in cleanup (ref was true)...');
+        try {
+          const stopPromise = Pitchy.stop();
+          if (stopPromise && typeof stopPromise.then === 'function') {
+            stopPromise
+              // .then(() => console.log('Pitchy stopped (main effect cleanup promise).'))
+              .catch((e: any) => { /* console.error('Error stopping Pitchy (main effect cleanup promise):', e) */ });
+            // Not setting pitchyStartedRef.current = false here immediately if async,
+            // as the operation is pending. It will be set below.
+          } else {
+            // console.warn('Pitchy.stop did not return a promise during main effect cleanup.');
+          }
+        } catch (e: any) {
+          // console.error('Error calling Pitchy.stop (main effect cleanup catch):', e);
+        }
+        pitchyStartedRef.current = false; // Mark as stopped or attempt to stop was made
       } else {
-        console.log('Pitchy was not started or already stopped, skipping stop call.');
+        // console.log('Pitchy.stop() skipped in cleanup (ref was false).');
       }
       
       if (soundLevelStartedRef.current) {
+        // console.log('Attempting to stop RNSoundLevel in cleanup (ref was true)...');
         RNSoundLevel.stop();
-        // RNSoundLevel.onNewFrame = () => {}; // DO NOT clear onNewFrame here
         soundLevelStartedRef.current = false; // Mark as stopped
-        console.log('RNSoundLevel stopped.');
+        // console.log('RNSoundLevel stopped (main effect cleanup).');
       } else {
-        console.log('RNSoundLevel was not started or already stopped, skipping stop call.');
+        // console.log('RNSoundLevel.stop() skipped in cleanup (ref was false).');
       }
     };
-  }, []); // REMOVED [volume] from dependency array, this effect runs once on mount/unmount
-
-
+  }, [isPitchyInitialized]); // Removed frequencyToNote from dependencies
 
   const onVisualizerLayout = (event: LayoutChangeEvent) => {
     const { width, height } = event.nativeEvent.layout;
@@ -219,6 +372,14 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.container}>
+
+      {/* Settings Button - Placed at top right or a dedicated settings area */}
+      <View style={styles.headerControls}>
+        <Pressable onPress={() => setSettingsModalVisible(true)} style={styles.settingsButton}>
+          <Text style={styles.settingsButtonText}>Settings</Text>
+        </Pressable>
+      </View>
+
       <View style={styles.mainContent}>
         {/* Frequency Display Area (Visualizer + Frequency Value + Detected Note) */}
         <View style={styles.frequencyDisplayContainer}>
@@ -236,6 +397,7 @@ export default function App() {
                 currentFrequency={currentFrequency}
                 targetFrequency={targetFrequency}
                 currentVolume={volume}
+                visualizerSensitivity={visualizerSensitivity} // Pass sensitivity here
               />
             )}
             {!visualizerLayout && (
@@ -252,6 +414,23 @@ export default function App() {
           </View>
         </View>
       </View>
+
+      <Modal
+        animationType="slide"
+        transparent={false}
+        visible={settingsModalVisible}
+        onRequestClose={() => {
+          setSettingsModalVisible(!settingsModalVisible);
+        }}
+      >
+        <SettingsScreen
+          noiseThreshold={noiseThreshold}
+          setNoiseThreshold={setNoiseThreshold}
+          visualizerSensitivity={visualizerSensitivity}
+          setVisualizerSensitivity={setVisualizerSensitivity}
+          onClose={() => setSettingsModalVisible(false)}
+        />
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -260,14 +439,26 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0D0D0D', // Darker, terminal-like background
-    paddingHorizontal: 20,
-    paddingTop: Platform.OS === 'android' ? 60 : 40,
-    paddingBottom: Platform.OS === 'android' ? 60 : 40,
+  },
+  headerControls: {
+    position: 'absolute', 
+    top: Platform.OS === 'android' ? 25 : 40, 
+    right: 15, // Position the container from the right edge
+    zIndex: 10, 
+  },
+  settingsButton: {
+    padding: 45, // Increased padding for a larger, more reliable touch target
+  },
+  settingsButtonText: {
+    fontSize: 24, 
+    color: NEON_GREEN,
   },
   mainContent: {
     flex: 1,
     position: 'relative',
-    // alignItems: 'center', // No longer needed here for the note, frequencyDisplayContainer handles its children
+    paddingHorizontal: 20, 
+    paddingTop: Platform.OS === 'ios' ? 90 : 80,
+    paddingBottom:  Platform.OS === 'android' ? 20 : 40,
   },
   detectedNoteContainer: {
     paddingVertical: 5, 
@@ -286,8 +477,10 @@ const styles = StyleSheet.create({
     borderColor: '#003300', // Dark green border
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingTop: 60,
-    paddingBottom: 100,
+    marginTop: 40,
+    marginBottom:50,
+    paddingTop: 40, // Adjusted from 60
+    paddingBottom: 40, // Adjusted from 100
     paddingHorizontal: 10,
   },
   visualizerAreaContainer: { 
@@ -308,7 +501,6 @@ const styles = StyleSheet.create({
   frequencyInfoText: {
     fontSize: 16,
     color: '#2AAA8A', // Dimmer neon green text
-    marginTop: 10,
   },
   frequencyValueText: {
     fontSize: 22,

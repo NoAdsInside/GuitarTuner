@@ -15,7 +15,8 @@ interface FrequencyVisualizerProps {
   height: number;
   currentFrequency: number | null;
   targetFrequency: number | null;
-  currentVolume: number | null; // New prop for volume
+  currentVolume: number | null;
+  visualizerSensitivity: number;
   // We can add more props for styling, range, etc.
 }
 
@@ -23,38 +24,42 @@ const NEON_GREEN = '#39FF14';
 const NEON_GREEN_TRANSPARENT = 'rgba(57, 255, 20, 0.6)'; // #39FF14 with 0.6 alpha
 const NEON_GREEN_GLOW_COLOR = 'rgba(57, 255, 20, 0.25)'; // For the tail glow
 
-const CENTS_RANGE = 50; // Range in cents (+/-) for visual deviation.
+// const CENTS_RANGE = 50; // No longer needed for dot positioning
 const MAX_TAIL_POINTS = 150; // Maximum number of points in the indicator's tail.
 const TAIL_COLOR = NEON_GREEN_TRANSPARENT;
 const TAIL_STROKE_WIDTH = 4; // Stroke width for the tail.
 const TAIL_GLOW_STROKE_WIDTH = TAIL_STROKE_WIDTH + 8; // Stroke width for the tail's glow effect.
 const INDICATOR_RADIUS = 8; // Radius of the main frequency indicator dot.
 const TAIL_FALL_SPEED = 1.5; // Speed at which the tail falls (pixels per age unit).
-const ANIMATION_TENSION = 40; // Spring animation tension for the indicator.
-const ANIMATION_FRICTION = 15; // Spring animation friction for the indicator.
-const FREQUENCY_THRESHOLD = 0.1; // Hz: Minimum change in frequency to trigger an update.
-const MIN_VISUALIZATION_VOLUME = -90; // dBFS: Minimum volume for the visualizer to display elements.
-const INITIAL_SETTLING_DELAY = 75; // ms: Delay to allow transient sounds to settle before showing indicator.
+const ANIMATION_TENSION = 30; // Spring animation tension for the indicator.
+const ANIMATION_FRICTION = 25; // Spring animation friction for the indicator.
+const MIN_VISUALIZATION_VOLUME = -90; // dBFS: Minimum volume for any visual elements to appear.
+const INITIAL_SETTLING_DELAY = 150; // ms: Delay to allow transient sounds to settle before showing indicator.
+
+const SMOOTHING_ALPHA = 0.2; // Lower values = more smoothing. E.g., 0.2 means 20% new, 80% previous.
 
 // Constants for the diffuse glow circles effect in the tail.
 const GLOW_CIRCLE_INITIAL_OPACITY = 0.15;
 const GLOW_CIRCLE_FINAL_OPACITY = 0.0;
+const GRID_LINE_COLOR = NEON_GREEN_GLOW_COLOR; // Use existing glow color for grid lines
+const GRID_LINE_STROKE_WIDTH = "1";
+const GRID_LINE_PROPORTIONS = [0.25, 0.5, 0.75]; // Proportions of half-width for grid lines
 const GLOW_CIRCLE_INITIAL_RADIUS = TAIL_STROKE_WIDTH * 0.8;
 const GLOW_CIRCLE_MAX_RADIUS_FACTOR = 2;
 const MAX_AGE_FOR_GLOW_SCALING = MAX_TAIL_POINTS * 0.6;
 
-// Helper function to convert frequency difference to cents
-function getCentsDifference(baseFrequency: number, targetFrequency: number): number {
-  if (baseFrequency <= 0 || targetFrequency <= 0) return 0;
-  return 1200 * Math.log2(targetFrequency / baseFrequency);
-}
+// function getCentsDifference(baseFrequency: number, targetFrequency: number): number { // No longer needed
+//   if (baseFrequency <= 0 || targetFrequency <= 0) return 0;
+//   return 1200 * Math.log2(targetFrequency / baseFrequency);
+// }
 
 const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
   width,
   height,
   currentFrequency,
   targetFrequency,
-  currentVolume, // Destructure new prop
+  currentVolume,
+  visualizerSensitivity,
 }) => {
   // Initialize Animated.Value with a placeholder (e.g., 0 or initial width/2 if width is immediately available)
   // It will be properly set in useEffect when width is confirmed.
@@ -62,7 +67,6 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
   const currentAnimatedX = useRef(width > 0 ? width / 2 : 0); // Tracks the current animated X value
   
   const [rawIndicatorTargetX, setRawIndicatorTargetX] = useState(width > 0 ? width / 2 : 0);
-  const displayedFrequencyRef = useRef<number | null>(null); // Stores the frequency for 0.1Hz threshold
   
   const [tailPoints, setTailPoints] = useState<TailPoint[]>([]);
   const animationFrameId = useRef<number | null>(null);
@@ -70,6 +74,7 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
   const wasPreviouslyVisible = useRef(false); // To detect transition to visible
   const [isSettling, setIsSettling] = useState(false);
   const settlingTimerRef = useRef<number | null>(null);
+  const smoothedFrequencyRef = useRef<number | null>(null);
 
   // Resets indicator position and state when width changes (e.g., on orientation change).
   useEffect(() => {
@@ -83,7 +88,6 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
         animatedIndicatorX.setValue(initialX);
         currentAnimatedX.current = initialX; // Sync our manual tracker
       });
-      displayedFrequencyRef.current = null;
       isIndicatorCurrentlyVisible.current = false; 
       wasPreviouslyVisible.current = false;
       setIsSettling(false);
@@ -95,13 +99,12 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
         animatedIndicatorX.setValue(0);
         currentAnimatedX.current = 0;
       });
-      displayedFrequencyRef.current = null;
       isIndicatorCurrentlyVisible.current = false;
       wasPreviouslyVisible.current = false;
       setIsSettling(false);
       if (settlingTimerRef.current) clearTimeout(settlingTimerRef.current);
     }
-  }, [width]); // Only width. animatedIndicatorX is stable due to useRef.
+  }, [width, animatedIndicatorX]); // Only width. animatedIndicatorX is stable due to useRef.
 
   if (width === 0 || height === 0) {
     return null; // Don't render if dimensions are not yet available
@@ -112,49 +115,40 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
 
   // Re-attach listener when rawIndicatorTargetX changes
   useEffect(() => {
-    // console.log(`Attaching listener. TargetX: ${rawIndicatorTargetX.toFixed(2)}`);
     const listenerId = animatedIndicatorX.addListener(({ value }) => {
-      // console.log(`Listener: currentAnimatedX.current = ${value.toFixed(2)}`);
       currentAnimatedX.current = value;
     });
     return () => {
-    //   console.log(`Removing listener. Old TargetX: ${rawIndicatorTargetX.toFixed(2)}`);
       animatedIndicatorX.removeListener(listenerId);
     };
   }, [animatedIndicatorX, rawIndicatorTargetX]); // Re-run when target changes
 
-  // Effect to calculate and set the target X for the indicator dot based on 0.1Hz frequency threshold
+  // Effect to calculate and set the target X for the indicator dot
   useEffect(() => {
     if (width === 0 || height === 0) return;
 
+    const centerX = width / 2;
     let newCalculatedTargetX = centerX;
-    let nextIndicatorVisibleState = false; // Calculate next state before setting ref
+    let nextIndicatorVisibleState = false;
 
-    // Determine base visibility based on volume and valid frequencies.
     if (currentVolume !== null && currentVolume >= MIN_VISUALIZATION_VOLUME) {
       if (currentFrequency !== null && targetFrequency !== null) {
         nextIndicatorVisibleState = true; 
       } else {
         // Volume OK, but no valid frequencies
-        displayedFrequencyRef.current = null;
-        // nextIndicatorVisibleState remains false
       }
     } else {
       // Volume too low
-      displayedFrequencyRef.current = null;
-      // nextIndicatorVisibleState remains false
     }
 
-    // Handle settling delay when indicator becomes visible
     if (nextIndicatorVisibleState && !wasPreviouslyVisible.current) {
       setIsSettling(true);
-      if (settlingTimerRef.current) clearTimeout(settlingTimerRef.current); // Clear any existing
+      if (settlingTimerRef.current) clearTimeout(settlingTimerRef.current);
       settlingTimerRef.current = setTimeout(() => {
         setIsSettling(false);
         settlingTimerRef.current = null;
       }, INITIAL_SETTLING_DELAY);
     } else if (!nextIndicatorVisibleState && wasPreviouslyVisible.current) {
-      // Became not visible, clear settling state and timer immediately
       setIsSettling(false);
       if (settlingTimerRef.current) clearTimeout(settlingTimerRef.current);
       settlingTimerRef.current = null;
@@ -162,39 +156,45 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
     wasPreviouslyVisible.current = nextIndicatorVisibleState;
     isIndicatorCurrentlyVisible.current = nextIndicatorVisibleState && !isSettling;
 
-    // Actual frequency processing for dot position, only if not settling and visible
-    if (nextIndicatorVisibleState && !isSettling) {
-        let freqToUseForCalc = displayedFrequencyRef.current;
-        // This check should ideally use currentFrequency from props, not displayedFrequencyRef for the THRESHOLD check
-        // when deciding *whether to update* displayedFrequencyRef.
-        if (displayedFrequencyRef.current === null || 
-            (currentFrequency !== null && Math.abs(currentFrequency - displayedFrequencyRef.current) >= FREQUENCY_THRESHOLD)) {
-          if (currentFrequency !== null) displayedFrequencyRef.current = currentFrequency;
-          freqToUseForCalc = currentFrequency; // Use the live current frequency if it passed threshold or ref was null
-        }
-        // If after thresholding, freqToUseForCalc is still null (e.g. currentFrequency was null but we passed volume check)
-        // then we should not proceed to calculate position with it.
-        if (freqToUseForCalc !== null && targetFrequency !== null) { // Ensure targetFrequency is also not null
-          const centsDiff = getCentsDifference(targetFrequency, freqToUseForCalc);
-          const deviationRatio = Math.max(-1, Math.min(1, centsDiff / CENTS_RANGE));
-          newCalculatedTargetX = centerX + deviationRatio * (width / 2); 
-        } else {
-          // Freq to use for calc is null, or target is null. Stay centered.
-          isIndicatorCurrentlyVisible.current = false; // Override visibility if no valid freq for calc
-          newCalculatedTargetX = centerX;
-        }
+    let frequencyToUseForVisuals: number | null = null;
+    if (currentFrequency !== null) {
+      if (smoothedFrequencyRef.current === null || !isIndicatorCurrentlyVisible.current) {
+        // If no prior smoothed value, or if indicator is not currently active (e.g., hidden or settling),
+        // seed/reset with current frequency to avoid stale smoothed values.
+        smoothedFrequencyRef.current = currentFrequency;
+      } else {
+        // Apply smoothing only when the indicator is active and has a previous smoothed value
+        smoothedFrequencyRef.current = 
+          (currentFrequency * SMOOTHING_ALPHA) + 
+          (smoothedFrequencyRef.current * (1 - SMOOTHING_ALPHA));
+      }
+      frequencyToUseForVisuals = smoothedFrequencyRef.current;
     } else {
-        // Not visible or is settling, target center
-        // If it became not visible, displayedFrequencyRef is already nulled by volume/freq check block
-        // If just settling, we don't want to null displayedFrequencyRef here, as it holds the pre-settling target
-        newCalculatedTargetX = centerX;
+      smoothedFrequencyRef.current = null; // Reset if raw frequency is null
+      frequencyToUseForVisuals = null;
+    }
+
+    if (isIndicatorCurrentlyVisible.current && frequencyToUseForVisuals !== null && targetFrequency !== null) {
+      const effectiveSensitivity = Math.max(0.01, visualizerSensitivity);
+      const hzDifference = frequencyToUseForVisuals - targetFrequency;
+      
+      let deviationRatio = hzDifference / effectiveSensitivity;
+      deviationRatio = Math.max(-1, Math.min(1, deviationRatio));
+      
+      newCalculatedTargetX = centerX + deviationRatio * (width / 2); 
+    } else {
+      // Not visible, or is settling, or frequencies are null: target center
+      newCalculatedTargetX = centerX;
     }
     
-    if (Math.abs(newCalculatedTargetX - rawIndicatorTargetX) > 0.01) {
-      setRawIndicatorTargetX(newCalculatedTargetX);
-    }
-  // Added isSettling to deps, as it influences logic flow here.
-  }, [currentFrequency, targetFrequency, currentVolume, width, height, rawIndicatorTargetX, CENTS_RANGE, centerX, isSettling]);
+    setRawIndicatorTargetX(prevRawTargetX => {
+      if (Math.abs(newCalculatedTargetX - prevRawTargetX) > 0.01) {
+        return newCalculatedTargetX;
+      }
+      return prevRawTargetX;
+    });
+
+  }, [currentFrequency, targetFrequency, currentVolume, width, height, isSettling, visualizerSensitivity]);
 
   // Effect to animate the indicator dot to the rawIndicatorTargetX
   useEffect(() => {
@@ -209,19 +209,14 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
   }, [rawIndicatorTargetX, animatedIndicatorX, width]);
 
   const animationLoop = useCallback(() => {
-    // console.log(`AnimationLoop: isIndicatorCurrentlyVisible.current: ${isIndicatorCurrentlyVisible.current}, currentAnimatedX: ${currentAnimatedX.current.toFixed(2)}`);
     setTailPoints(prevPoints => {
       let updatedPoints = prevPoints.map(p => ({ ...p, age: p.age + 1 }));
       if (isIndicatorCurrentlyVisible.current) { 
-        // console.log(`Adding tail point at X: ${currentAnimatedX.current.toFixed(2)}`);
         const newPoint: TailPoint = { x: currentAnimatedX.current, age: 0 };
         updatedPoints = [newPoint, ...updatedPoints];
       }
-      // Use local centerY and height from the outer scope, which are fresh each render the callback might be defined in.
-      // However, this callback is meant to be stable based on its deps.
-      // Let's ensure it uses the `centerY` and `height` captured when it was defined.
-      const currentCenterY = height / 2; // Recalculate based on height prop for this specific call scope
-      const currentHeight = height; // Capture height prop for this specific call scope
+      const currentCenterY = height / 2;
+      const currentHeight = height;
 
       updatedPoints = updatedPoints
         .filter(p => (currentCenterY + INDICATOR_RADIUS) + (p.age * TAIL_FALL_SPEED) < currentHeight + TAIL_STROKE_WIDTH)
@@ -229,7 +224,7 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
       return updatedPoints;
     });
     animationFrameId.current = requestAnimationFrame(animationLoop);
-  }, [height, rawIndicatorTargetX]); // Removed centerY, it's derived from height. Kept rawIndicatorTargetX
+  }, [height, rawIndicatorTargetX, isIndicatorCurrentlyVisible, currentAnimatedX]); 
 
   useEffect(() => {
     animationFrameId.current = requestAnimationFrame(animationLoop);
@@ -252,6 +247,32 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
         strokeWidth="2"
       />
 
+      {/* Grid Lines */}
+      {GRID_LINE_PROPORTIONS.map((proportion) => {
+        const xPositionLeft = centerX - proportion * (width / 2);
+        const xPositionRight = centerX + proportion * (width / 2);
+        return (
+          <React.Fragment key={`grid-${proportion}`}>
+            <Line
+              x1={xPositionLeft}
+              y1={0}
+              x2={xPositionLeft}
+              y2={height}
+              stroke={GRID_LINE_COLOR}
+              strokeWidth={GRID_LINE_STROKE_WIDTH}
+            />
+            <Line
+              x1={xPositionRight}
+              y1={0}
+              x2={xPositionRight}
+              y2={height}
+              stroke={GRID_LINE_COLOR}
+              strokeWidth={GRID_LINE_STROKE_WIDTH}
+            />
+          </React.Fragment>
+        );
+      })}
+
       {/* Render Diffuse Glow Circles (drawn first, so they are underneath the main tail) */}
       {tailPoints.map((point, index) => {
         // Determine scale factor based on age (0 = newest, 1 = oldest effectively for scaling)
@@ -270,7 +291,7 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
         
         return (
           <Circle
-            key={`glow-${index}`}
+            key={String(index) + '_glow'}
             cx={point.x}
             cy={pointY}
             r={glowRadius}
