@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, Button, Platform } from 'react-native';
 import Slider from '@react-native-community/slider';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -22,6 +22,14 @@ const SettingsScreen: React.FC<SettingsScreenProps> = ({
   setVisualizerSensitivity,
   onClose,
 }) => {
+  // Local, live value for the noise-threshold label. The committed value
+  // (setNoiseThreshold) is only pushed on slide-complete, because changing it
+  // restarts the Pitchy recorder — we don't want that on every drag tick.
+  const [noiseThresholdDisplay, setNoiseThresholdDisplay] = useState(noiseThreshold);
+  useEffect(() => {
+    setNoiseThresholdDisplay(noiseThreshold);
+  }, [noiseThreshold]);
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.container}>
@@ -30,7 +38,7 @@ const SettingsScreen: React.FC<SettingsScreenProps> = ({
         {/* Noise Threshold Setting */}
         <View style={styles.settingContainer}>
           <Text style={styles.label}>
-            Noise Threshold: {noiseThreshold.toFixed(0)} dBFS
+            Noise Threshold: {noiseThresholdDisplay.toFixed(0)} dBFS
           </Text>
           <Text style={styles.description}>
             Minimum volume to detect notes. Quieter sounds are ignored.
@@ -41,7 +49,8 @@ const SettingsScreen: React.FC<SettingsScreenProps> = ({
             maximumValue={-20} // Less sensitive
             step={1}
             value={noiseThreshold}
-            onValueChange={setNoiseThreshold}
+            onValueChange={setNoiseThresholdDisplay}
+            onSlidingComplete={setNoiseThreshold}
             minimumTrackTintColor={NEON_GREEN}
             maximumTrackTintColor={DIM_GREEN}
             thumbTintColor={NEON_GREEN}

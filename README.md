@@ -1,6 +1,6 @@
 # Guitar Tuner Chromatic
 
-A mobile application built with React Native and Expo that provides a real-time guitar tuner. It detects the frequency of sound input via the microphone and displays the closest musical note, along with a visual indicator to help tune your instrument accurately.
+A mobile application built with **bare React Native** (Android) that provides a real-time guitar tuner. It detects the frequency of sound input via the microphone and displays the closest musical note, along with a visual indicator to help tune your instrument accurately.
 
 ## Features
 
@@ -13,14 +13,13 @@ A mobile application built with React Native and Expo that provides a real-time 
 
 ## Tech Stack
 
-*   **React Native**: For cross-platform mobile app development.
-*   **Expo**: For building and running React Native applications, including managing native modules and build processes.
+*   **React Native** (0.79, New Architecture): Bare workflow, Android-only. Builds are fully local via Gradle — no Expo and no cloud build service.
 *   **TypeScript**: For static typing and improved code quality.
-*   **Expo Audio**: For microphone access and recording permissions.
-*   **react-native-pitchy**: For real-time pitch detection.
-*   **react-native-sound-level**: For monitoring input sound levels.
-*   **react-native-svg**: For creating the custom frequency visualizer.
-*   **Expo Router**: For file-system based routing (though minimally used in this single-view app).
+*   **PermissionsAndroid** (core React Native): For microphone recording permission.
+*   **react-native-pitchy**: Native (Kotlin/C++) real-time pitch detection — the sole microphone client.
+*   **react-native-svg**: For the custom frequency visualizer.
+*   **@react-native-community/slider**: For the settings sliders.
+*   **react-native-safe-area-context**: Safe-area insets.
 
 ## Local Development Setup
 
@@ -28,62 +27,115 @@ Follow these instructions to get the project running on your local machine for d
 
 ### Prerequisites
 
-*   **Node.js**: Version 18 LTS or higher. You can download it from [nodejs.org](https://nodejs.org/).
-*   **npm** (comes with Node.js) or **Yarn**: For package management.
-*   **Expo CLI**: Install it globally after Node.js:
-    ```bash
-    npm install -g expo-cli
-    ```
-*   **Git**: For cloning the repository. Download from [git-scm.com](https://git-scm.com/).
-*   **Expo Go app**: Install on your iOS or Android physical device (or use an emulator/simulator).
+*   **Node.js**: Version 18 LTS or higher. Download from [nodejs.org](https://nodejs.org/).
+*   **npm** (comes with Node.js): For package management.
+*   **JDK 17**: Required by the Android Gradle plugin.
+*   **Android Studio + Android SDK**: Install the Android SDK, platform tools, and an emulator (or use a physical device). Set the `ANDROID_HOME` environment variable (e.g. `~/Library/Android/sdk` on macOS) or add a `android/local.properties` with `sdk.dir=...`.
+*   **A physical Android device or emulator with a microphone**: Pitch detection needs real mic input.
+*   **Git**: For cloning the repository.
+
+> This is a bare React Native app — there is **no Expo Go**. You run it as a locally built native app.
 
 ### Installation & Running
 
 1.  **Clone the repository**:
     ```bash
     git clone https://github.com/NoAdsInside/GuitarTuner.git
-    cd guitarTuner 
+    cd guitarTuner
     ```
-    (Replace `<your-repository-url>` with the actual URL of your GitHub repository)
 
 2.  **Install dependencies**:
-    Navigate to the project directory (`guitarTuner`) and install the necessary packages.
-    Using npm:
     ```bash
     npm install
     ```
-    Or using Yarn:
+
+3.  **Start the Metro bundler** (in one terminal):
     ```bash
-    yarn install
+    npm start
     ```
 
-3.  **Start the development server**:
+4.  **Build and run on a device/emulator** (in another terminal, with a device connected or an emulator running):
     ```bash
-    npx expo start
+    npm run android
     ```
-    This will start the Metro Bundler and display a QR code in your terminal.
+    This builds the app with Gradle, installs it, and launches it. Grant the microphone permission when prompted. Subsequent JS changes hot-reload via Metro.
 
-4.  **Run on your device/emulator**:
-    *   **On a physical device**: Open the Expo Go app on your Android or iOS device and scan the QR code from the terminal.
-    *   **On an emulator/simulator**:
-        *   Press `a` in the terminal to attempt to open on an Android Emulator (if configured).
-        *   Press `i` in the terminal to attempt to open on an iOS Simulator (macOS only, if Xcode is configured).
+### Other useful commands
 
-The app should now be running in development mode, and any changes you make to the code will automatically reload the app.
+```bash
+npm run lint                             # eslint .
+npx tsc --noEmit                         # TypeScript typecheck
+cd android && ./gradlew assembleDebug    # build a debug APK locally
+cd android && ./gradlew bundleRelease    # build a release .aab (sign with a real keystore before publishing)
+```
+
+There is no test suite configured.
+
+## Standalone build (run on a phone without a computer)
+
+`npm run android` installs a **debug** build, which does **not** contain the JavaScript — it loads it at runtime from the Metro dev server on `localhost:8081`. On a phone that isn't tethered to your machine with Metro running, that fails with *"Unable to load script / Could not connect to development server."*
+
+For an app that runs on its own, build a **release** APK — it bundles the JS inside the APK, so no computer or Metro is needed.
+
+### 1. Build the release APK
+
+```bash
+cd android && ./gradlew assembleRelease
+```
+
+The APK is written to:
+
+```
+android/app/build/outputs/apk/release/app-release.apk
+```
+
+### 2. Get it onto your phone
+
+**Option A — install directly over USB (recommended):**
+
+1. On the phone, enable **Developer options** (Settings → About phone → tap *Build number* 7 times), then turn on **USB debugging** (Settings → System → Developer options).
+2. Connect the phone via USB and tap **Allow** on the "Allow USB debugging?" prompt.
+3. Confirm the device is visible and install:
+   ```bash
+   adb devices                       # should list your device as "device" (not "unauthorized")
+   adb install -r android/app/build/outputs/apk/release/app-release.apk
+   ```
+   (`-r` reinstalls over an existing copy. If both a phone and an emulator are connected, add `-d` to target the USB device, or `-s <serial>` to pick one.)
+
+> `adb` lives in `$ANDROID_HOME/platform-tools/adb` if it isn't on your `PATH`. Note: the phone's macOS **file-transfer (MTP)** mode is *not* what enables `adb` — **USB debugging** is. Finder does not show Android devices.
+
+**Option B — copy the file:** send `app-release.apk` to the phone by any means (Google Drive, email, AirDroid, etc.) and open it on the device to install. You'll need to allow *"install from unknown sources"* for the app you opened it from.
+
+### 3. Launch it
+
+Open **guitarTuner** from the app drawer and grant the microphone permission on first launch. To launch from the CLI instead:
+
+```bash
+adb shell monkey -p com.cptvitruvian.guitarTuner 1
+```
+
+### Signing note
+
+By default the `release` build is signed with the **debug keystore** (see `android/app/build.gradle`). That is fine for personal use and sideloading, but it is **not** acceptable for the Google Play Store, and updates only install over an existing copy if the signature matches. To distribute properly, generate your own release keystore, wire it into a `release` `signingConfig`, and build a signed app bundle:
+
+```bash
+cd android && ./gradlew bundleRelease    # -> app/build/outputs/bundle/release/app-release.aab
+```
 
 ## Project Structure
 
-*   `app/`: Contains the main application code, using Expo Router for file-based routing.
-    *   `index.tsx`: The main screen of the application.
-    *   `FrequencyVisualizer.tsx`: The custom component for displaying the tuning indicator.
-    *   `_layout.tsx`: Defines the root layout for Expo Router.
-*   `assets/`: Contains static assets like images and fonts.
-    *   `images/`: Specifically for icon files, splash screen, etc.
-*   `app.json`: Expo configuration file for project metadata, build settings, plugins, etc.
-*   `package.json`: Lists project dependencies and scripts.
+*   `index.js`: App entry point — registers the root component (`main`) with `AppRegistry`, wrapped in `SafeAreaProvider`.
+*   `app/`: Application code (a single screen).
+    *   `index.tsx`: The main screen — owns the audio lifecycle, permission handling, and frequency↔note logic.
+    *   `FrequencyVisualizer.tsx`: The custom SVG component for the tuning indicator.
+    *   `SettingsScreen.tsx`: The settings modal body (noise threshold + visualizer sensitivity sliders).
+*   `android/`: Native Android Gradle project (plain React Native, checked in).
+*   `assets/`: Static assets (images, fonts).
+*   `metro.config.js` / `babel.config.js`: Metro bundler and Babel configuration.
+*   `package.json`: Dependencies and scripts.
 
 ## Contributing
 
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change. Feel free to fork, copy, clone and use this in any way you wish. You don't have to credit, I don't mind, this is for you. Most of it was written with the help of AI as an experiment in building simple things, fast and giving them to the community for free. 
+Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change. Feel free to fork, copy, clone and use this in any way you wish. You don't have to credit, I don't mind, this is for you. Most of it was written with the help of AI as an experiment in building simple things, fast and giving them to the community for free.
 
 ---

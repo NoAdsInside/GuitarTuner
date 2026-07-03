@@ -28,7 +28,6 @@ const NEON_GREEN_GLOW_COLOR = 'rgba(57, 255, 20, 0.25)'; // For the tail glow
 const MAX_TAIL_POINTS = 150; // Maximum number of points in the indicator's tail.
 const TAIL_COLOR = NEON_GREEN_TRANSPARENT;
 const TAIL_STROKE_WIDTH = 4; // Stroke width for the tail.
-const TAIL_GLOW_STROKE_WIDTH = TAIL_STROKE_WIDTH + 8; // Stroke width for the tail's glow effect.
 const INDICATOR_RADIUS = 8; // Radius of the main frequency indicator dot.
 const TAIL_FALL_SPEED = 1.5; // Speed at which the tail falls (pixels per age unit).
 const ANIMATION_TENSION = 30; // Spring animation tension for the indicator.
@@ -158,30 +157,33 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
 
     let frequencyToUseForVisuals: number | null = null;
     if (currentFrequency !== null) {
-      if (smoothedFrequencyRef.current === null || !isIndicatorCurrentlyVisible.current) {
-        // If no prior smoothed value, or if indicator is not currently active (e.g., hidden or settling),
-        // seed/reset with current frequency to avoid stale smoothed values.
+      if (smoothedFrequencyRef.current === null) {
+        // No prior smoothed value (first frame after true silence): seed with the
+        // current frequency. We deliberately do NOT reseed across the settling
+        // transition — the upstream pipeline already delivers a stable stream, so
+        // keeping the EMA history here avoids a visible jump when settling ends.
         smoothedFrequencyRef.current = currentFrequency;
       } else {
-        // Apply smoothing only when the indicator is active and has a previous smoothed value
-        smoothedFrequencyRef.current = 
-          (currentFrequency * SMOOTHING_ALPHA) + 
+        smoothedFrequencyRef.current =
+          (currentFrequency * SMOOTHING_ALPHA) +
           (smoothedFrequencyRef.current * (1 - SMOOTHING_ALPHA));
       }
       frequencyToUseForVisuals = smoothedFrequencyRef.current;
     } else {
-      smoothedFrequencyRef.current = null; // Reset if raw frequency is null
+      smoothedFrequencyRef.current = null; // Reset on true silence (null frequency)
       frequencyToUseForVisuals = null;
     }
 
     if (isIndicatorCurrentlyVisible.current && frequencyToUseForVisuals !== null && targetFrequency !== null) {
       const effectiveSensitivity = Math.max(0.01, visualizerSensitivity);
       const hzDifference = frequencyToUseForVisuals - targetFrequency;
-      
-      let deviationRatio = hzDifference / effectiveSensitivity;
-      deviationRatio = Math.max(-1, Math.min(1, deviationRatio));
-      
-      newCalculatedTargetX = centerX + deviationRatio * (width / 2); 
+
+      // Soft saturation (tanh) instead of a hard clamp: the dot eases toward the
+      // rail on a large-but-real detuning rather than snapping to it. Stays in
+      // (-1, 1); at ±sensitivity Hz the dot sits ~76% of the way out.
+      const deviationRatio = Math.tanh(hzDifference / effectiveSensitivity);
+
+      newCalculatedTargetX = centerX + deviationRatio * (width / 2);
     } else {
       // Not visible, or is settling, or frequencies are null: target center
       newCalculatedTargetX = centerX;

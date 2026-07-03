@@ -1,12 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { View, StyleSheet, Button, Alert, Text, TouchableOpacity, Platform, LayoutChangeEvent, SafeAreaView, Modal, Pressable } from 'react-native';
-import { AudioModule } from 'expo-audio'; // For permissions
-import Pitchy, { PitchyConfig, PitchyEventCallback } from 'react-native-pitchy';
-import RNSoundLevel from 'react-native-sound-level'; // Import RNSoundLevel
+import { View, StyleSheet, Alert, Text, Platform, LayoutChangeEvent, SafeAreaView, Modal, Pressable, Linking, AppState, PermissionsAndroid } from 'react-native';
+import Pitchy, { PitchyConfig } from 'react-native-pitchy';
 import FrequencyVisualizer from './FrequencyVisualizer'; // Import the new component
 import SettingsScreen from './SettingsScreen'; // Import SettingsScreen
+import TuningSelector from './TuningSelector'; // Instrument/tuning picker
+import NotePicker from './NotePicker'; // Scrollable note list for customising a string
+import { INSTRUMENTS, Instrument, Tuning } from './tunings';
 
-const allPossibleNotes = ["C", "C♯/D♭", "D", "D♯/E♭", "E", "F", "F♯/G♭", "G", "G♯/A♭", "A", "A♯/B♭", "B"];
 const noteBaseNames = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]; // For naming convention
 
 const NEON_GREEN = '#39FF14'; // For Matrix/Fallout theme
@@ -40,6 +40,53 @@ interface DetailedNote {
 const MIN_GUITAR_FREQUENCY = 30; // Minimum frequency to consider for guitar tuning (approx Low B0)
 const MAX_GUITAR_FREQUENCY = 1300; // Maximum frequency to consider for guitar tuning
 
+// --- Pitch-detection stabilization ---------------------------------------
+// The raw Pitchy stream is noisy: plucked strings ring with strong harmonics,
+// so a single frame can read an octave (2x) or a fifth-above-octave (3x) up,
+// and readings wobble across note-bin boundaries. Without correction the
+// visualizer dot jumps around or slams to one rail. We run every frame through
+// a small pipeline (confidence gate → octave fold → median → note hysteresis)
+// before committing it to state. Constants biased toward STABILITY over
+// responsiveness — a tuner holds a string for seconds, so a little settle
+// latency is imperceptible.
+//
+// Pitch algorithm: Pitchy defaults to ACF2+ (autocorrelation), the most
+// octave-error-prone option, and its `confidence` is a useless binary flag.
+// MPM (McLeod) has built-in octave-error mitigation and emits real graded
+// confidence. Switching is a pure JS config string — the native library
+// already contains MPM, so no NDK rebuild. Fallback: 'YIN' (use MIN_CONFIDENCE
+// ~0.5 for YIN).
+const PITCH_ALGORITHM = 'MPM' as const;
+// Reject frames below this NSDF-clarity confidence (MPM scale). NOTE: this is a
+// JS-side gate — Pitchy's `minConfidence` config field is NOT wired on Android
+// (Kotlin configure() ignores it), so gating must happen here on data.confidence.
+const MIN_CONFIDENCE = 0.6;
+// Median-of-N over the folded stream kills residual single-frame spikes without
+// the lag-smear of a mean. Kept small so a new note reflects quickly.
+const MEDIAN_WINDOW = 3;
+// Octave/harmonic fold: only fold a reading that is FALSE_FAR from the stable
+// reference (beyond ~3 semitones, so it can't be an adjacent string the player
+// genuinely moved to) AND whose folded candidate lands within FOLD_ACCEPT_CENTS.
+const FOLD_GUARD_CENTS = 350;
+const FOLD_ACCEPT_CENTS = 60;
+// Harmonic/subharmonic ratios to test when folding (2x/3x octave errors up,
+// 1/2 & 1/3 subharmonic errors down — 3rd harmonic matters for low bass strings).
+const HARMONIC_RATIOS = [0.5, 1, 2, 3, 1 / 3];
+// Note-switch hysteresis — applies ONLY when the incoming pitch is near the
+// held note (true boundary-flicker territory). A pitch more than
+// IMMEDIATE_SWITCH_CENTS away from the held note is an unambiguous note change
+// and switches instantly, so the dot never sits pegged against a stale target
+// (which looked like the new note was out of tune). At the boundary, a new note
+// must still repeat this many frames AND the current note must have been held
+// this long before switching. On silence, hold the note this long before blanking.
+const IMMEDIATE_SWITCH_CENTS = 70; // > half a semitone (50c boundary) + margin
+const SWITCH_CONFIRM_FRAMES = 2;
+const MIN_HOLD_MS = 120;
+const RELEASE_MS = 300;
+
+// Cents (log-frequency) distance between two frequencies.
+const centsBetween = (a: number, b: number) => 1200 * Math.log2(a / b);
+
 // Create a memoized list of standard (unrounded) note frequencies
 // This ensures the target frequencies for notes are their true musical values,
 // unaffected by the visualizerSensitivity setting which only controls display scaling.
@@ -57,49 +104,117 @@ const getStandardNoteFrequencies = (): DetailedNote[] => {
   return notes;
 };
 
+// Module-level derived helpers (built once from the standard table):
+// - NOTE_FREQUENCY_BY_NAME: noteNameWithOctave → true (unrounded) frequency,
+//   used to look up a tuning string's frequency when narrowing classification.
+// - ALL_NOTE_NAMES: every note C0..B5 sorted low → high, for the NotePicker list.
+const NOTE_FREQUENCY_BY_NAME: Record<string, number> = {};
+getStandardNoteFrequencies().forEach((n) => {
+  NOTE_FREQUENCY_BY_NAME[n.noteNameWithOctave] = n.frequency;
+});
+const ALL_NOTE_NAMES: string[] = getStandardNoteFrequencies()
+  .slice()
+  .sort((a, b) => a.frequency - b.frequency)
+  .map((n) => n.noteNameWithOctave);
+
 export default function App() {
   const [currentFrequency, setCurrentFrequency] = useState<number | null>(null);
   const [detectedNote, setDetectedNote] = useState<string | null>(null);
   const [targetFrequency, setTargetFrequency] = useState<number | null>(null); // For the visualizer
   const [visualizerLayout, setVisualizerLayout] = useState<{width: number, height: number} | null>(null);
-  const [volume, setVolume] = useState<number | null>(null);
-  const volumeRef = useRef<number | null>(null); // Ref to hold the latest volume for callbacks
   const pitchyStartedRef = useRef(false); // To track if Pitchy started
-  const soundLevelStartedRef = useRef(false); // To track if RNSoundLevel started
 
   // Settings State
   const [settingsModalVisible, setSettingsModalVisible] = useState(false);
+  // noiseThreshold maps directly to Pitchy's `minVolume` (dBFS). Pitchy gates
+  // pitch detection internally, so this is the single source of noise gating.
   const [noiseThreshold, setNoiseThreshold] = useState(-45); // Default noise threshold
   const [visualizerSensitivity, setVisualizerSensitivity] = useState(5); // Default visualizer sensitivity
 
-  // Ref for noiseThreshold to be used in callbacks within useEffect
-  const noiseThresholdRef = useRef(noiseThreshold);
-  useEffect(() => {
-      noiseThresholdRef.current = noiseThreshold;
-  }, [noiseThreshold]);
+  // Tuning State
+  // tuningStrings is the single switch: null = Chromatic (detect any note, no
+  // string buttons); non-null = an active tuning's notes (low → high), which
+  // both narrows classification to just these notes AND drives the headstock
+  // layout. It holds a working copy so per-string edits make a custom tuning.
+  const [tuningStrings, setTuningStrings] = useState<string[] | null>(null);
+  const [activeInstrumentName, setActiveInstrumentName] = useState<string | null>(null);
+  const [activeTuningName, setActiveTuningName] = useState<string | null>(null);
+  const [tuningModalVisible, setTuningModalVisible] = useState(false);
+  const [editingStringIndex, setEditingStringIndex] = useState<number | null>(null);
 
   // State for sensitivity-adjusted note frequencies
   const [currentDetailedNoteFrequencies, setCurrentDetailedNoteFrequencies] = useState<DetailedNote[]>([]);
 
-  // Effect to recalculate detailedNoteFrequencies when visualizerSensitivity changes
+  // --- Stabilization pipeline state -------------------------------------
+  // All mutable pipeline state lives in refs so the once-registered Pitchy
+  // listener always sees live values (never a stale closure). Reset together
+  // via resetPitchPipeline on teardown and tuning change. Declared here (above
+  // the tuning-reset effect) so resetPitchPipeline exists when that effect runs.
+  const pitchBufRef = useRef<number[]>([]);          // median-of-N ring buffer (folded values)
+  const lastStableFreqRef = useRef<number | null>(null); // octave-fold anchor = last committed freq
+  const heldNoteRef = useRef<string | null>(null);   // currently displayed note
+  const candidateRef = useRef<string | null>(null);  // note pending confirmation
+  const candidateCountRef = useRef(0);               // consecutive frames the candidate has repeated
+  const heldSinceMsRef = useRef(0);                  // when heldNote was committed (tCaptureMs epoch)
+  const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // debounced silence blank
+
+  const resetPitchPipeline = useCallback(() => {
+    pitchBufRef.current = [];
+    lastStableFreqRef.current = null;
+    heldNoteRef.current = null;
+    candidateRef.current = null;
+    candidateCountRef.current = 0;
+    heldSinceMsRef.current = 0;
+    if (releaseTimerRef.current != null) {
+      clearTimeout(releaseTimerRef.current);
+      releaseTimerRef.current = null;
+    }
+  }, []);
+
+  // Build the set of candidate notes used to classify an incoming pitch.
+  // Chromatic = the full 12×6 table; Tuning = only the active tuning's notes
+  // (so the app reports which string the input is nearest — the automatic
+  // active-string indicator).
+  //
+  // Use TRUE, UNROUNDED frequencies. Previously these were snapped to a
+  // visualizerSensitivity-sized grid, which collapsed adjacent low notes into
+  // one bin (D♯2 77.78 Hz and E2 82.41 Hz both rounded to 80 Hz), making the
+  // lower-colliding note unreachable — that's why low E never appeared in
+  // Chromatic mode. visualizerSensitivity controls ONLY the dot's zoom (handled
+  // in FrequencyVisualizer); it must not decide which note is detected.
   useEffect(() => {
     const newDetailedNotes: DetailedNote[] = [];
-    const sensitivity = Math.max(0.01, visualizerSensitivity);
-    noteFrequencyTable.forEach((octaveFrequencies, noteIndex) => {
-      const baseName = noteBaseNames[noteIndex];
-      octaveFrequencies.forEach((freq, octave) => {
-        const roundedFreq = Math.round(freq / sensitivity) * sensitivity;
-        newDetailedNotes.push({
-          noteNameWithOctave: `${baseName}${octave}`,
-          frequency: roundedFreq,
+
+    if (tuningStrings) {
+      tuningStrings.forEach((noteName) => {
+        const freq = NOTE_FREQUENCY_BY_NAME[noteName];
+        if (freq != null) {
+          newDetailedNotes.push({ noteNameWithOctave: noteName, frequency: freq });
+        }
+      });
+    } else {
+      noteFrequencyTable.forEach((octaveFrequencies, noteIndex) => {
+        const baseName = noteBaseNames[noteIndex];
+        octaveFrequencies.forEach((freq, octave) => {
+          newDetailedNotes.push({ noteNameWithOctave: `${baseName}${octave}`, frequency: freq });
         });
       });
-    });
+    }
     setCurrentDetailedNoteFrequencies(newDetailedNotes);
-  }, [visualizerSensitivity]);
+  }, [tuningStrings]);
 
-  // Callback to convert frequency to note using currentDetailedNoteFrequencies
-  // currentDetailedNoteFrequencies uses sensitivity-rounded frequencies to determine note "bins".
+  // Clear stale readings when switching tunings so a note classified under the
+  // previous set doesn't linger before the next detection arrives. Also reset
+  // the stabilization pipeline so no stale octave anchor / held note survives
+  // the mode switch.
+  useEffect(() => {
+    resetPitchPipeline();
+    setCurrentFrequency(null);
+    setDetectedNote(null);
+  }, [tuningStrings, resetPitchPipeline]);
+
+  // Convert a frequency to the nearest candidate note (by absolute Hz distance)
+  // against currentDetailedNoteFrequencies (true, unrounded frequencies).
   const frequencyToNote = useCallback((frequency: number): string | null => {
     if (frequency <= 0 || currentDetailedNoteFrequencies.length === 0) return null;
 
@@ -122,6 +237,108 @@ export default function App() {
     frequencyToNoteRef.current = frequencyToNote;
   }, [frequencyToNote]);
 
+  // Octave/harmonic fold + median. Given a raw pitch, fold obvious harmonic
+  // octave errors back onto the stable reference (BEFORE note classification,
+  // so it works even in tuning mode where the harmonic's octave has no bin),
+  // then median-filter to reject stragglers. Pure w.r.t. refs — stable identity.
+  const processPitch = useCallback((rawPitch: number): number => {
+    let folded = rawPitch;
+    const ref = lastStableFreqRef.current;
+    if (ref != null) {
+      const rawErr = Math.abs(centsBetween(rawPitch, ref));
+      // Only fold when the raw reading is too far to be a real adjacent note —
+      // otherwise trust it, so deliberate note changes aren't "stuck" on the old.
+      if (rawErr > FOLD_GUARD_CENTS) {
+        let best = rawPitch;
+        let bestErr = rawErr;
+        for (const ratio of HARMONIC_RATIOS) {
+          const cand = rawPitch * ratio;
+          if (cand < MIN_GUITAR_FREQUENCY || cand > MAX_GUITAR_FREQUENCY) continue;
+          const err = Math.abs(centsBetween(cand, ref));
+          if (err < bestErr) { bestErr = err; best = cand; }
+        }
+        if (best !== rawPitch && bestErr < FOLD_ACCEPT_CENTS) folded = best;
+      }
+    }
+
+    const buf = pitchBufRef.current;
+    buf.push(folded);
+    if (buf.length > MEDIAN_WINDOW) buf.shift();
+    const sorted = [...buf].sort((a, b) => a - b);
+    return sorted[sorted.length >> 1]; // median
+  }, []);
+
+  // Note-switch hysteresis: classify the stabilized frequency, but only change
+  // the displayed note when a new candidate is genuinely sustained. Also anchors
+  // the octave-fold reference to the committed frequency (closing the loop so
+  // the anchor only ever tracks notes that survived hysteresis).
+  const pickNote = useCallback((freq: number, tMs: number): string | null => {
+    const candidate = frequencyToNoteRef.current(freq);
+    const held = heldNoteRef.current;
+
+    const commit = (note: string | null) => {
+      heldNoteRef.current = note;
+      heldSinceMsRef.current = tMs;
+      candidateRef.current = null;
+      candidateCountRef.current = 0;
+      if (note != null) lastStableFreqRef.current = freq;
+      return note;
+    };
+
+    if (candidate === held) {
+      candidateRef.current = null;
+      candidateCountRef.current = 0;
+      if (held != null) lastStableFreqRef.current = freq; // anchor tracks the held note
+      return held;
+    }
+
+    // First detection after silence — commit immediately (nothing to debounce).
+    if (held == null) return commit(candidate);
+
+    // Unambiguous note change: the pitch is well clear of the held note, so this
+    // can't be boundary jitter — switch instantly rather than holding the old
+    // target (which would peg the dot and look out of tune during the wait).
+    const heldFreq = NOTE_FREQUENCY_BY_NAME[held];
+    if (heldFreq != null && Math.abs(centsBetween(freq, heldFreq)) > IMMEDIATE_SWITCH_CENTS) {
+      return commit(candidate);
+    }
+
+    // Near the held note's boundary — debounce: candidate must repeat AND the
+    // held note must have shown a while before we switch.
+    if (candidate === candidateRef.current) {
+      candidateCountRef.current += 1;
+    } else {
+      candidateRef.current = candidate;
+      candidateCountRef.current = 1;
+    }
+    const heldLongEnough = tMs - heldSinceMsRef.current >= MIN_HOLD_MS;
+    if (candidateCountRef.current >= SWITCH_CONFIRM_FRAMES && heldLongEnough) {
+      return commit(candidate);
+    }
+    return held; // keep the current note for now
+  }, []);
+
+  // Debounced silence: don't blank on a single dropped/gated frame (that strobes
+  // between plucks and during decay). Blank only after RELEASE_MS of no signal.
+  const handleSilence = useCallback(() => {
+    if (releaseTimerRef.current != null) return; // release already pending
+    releaseTimerRef.current = setTimeout(() => {
+      releaseTimerRef.current = null;
+      resetPitchPipeline();
+      setCurrentFrequency(null);
+      setDetectedNote(null);
+    }, RELEASE_MS);
+  }, [resetPitchPipeline]);
+
+  // Mirror the helpers into refs so the once-registered listener never holds a
+  // stale copy (same idiom as frequencyToNoteRef).
+  const processPitchRef = useRef(processPitch);
+  const pickNoteRef = useRef(pickNote);
+  const handleSilenceRef = useRef(handleSilence);
+  useEffect(() => { processPitchRef.current = processPitch; }, [processPitch]);
+  useEffect(() => { pickNoteRef.current = pickNote; }, [pickNote]);
+  useEffect(() => { handleSilenceRef.current = handleSilence; }, [handleSilence]);
+
   // Effect to update targetFrequency when detectedNote changes
   // It uses standardNoteFrequencies to get the true target for the visualizer.
   const standardNoteFrequencies = useMemo(() => getStandardNoteFrequencies(), []);
@@ -140,238 +357,226 @@ export default function App() {
     }
   }, [detectedNote, standardNoteFrequencies]);
 
-  // Effect for one-time Pitchy initialization
-  const [isPitchyInitialized, setIsPitchyInitialized] = useState(false); // New state for init tracking
-  useEffect(() => {
-    console.log('Attempting Pitchy.init()...');
-    const pitchyConfig: PitchyConfig = { minVolume: -50 }; 
+  // Step 1: microphone permission — must be granted BEFORE any native recorder
+  // is created, or Pitchy's AudioRecord comes up uninitialized and start() fails.
+  const [hasPermission, setHasPermission] = useState(false);
+
+  // Verify/request mic permission. On Android, if it was previously denied with
+  // "Don't ask again", the system dialog will NOT reappear no matter how many
+  // times we ask — so in that case we route the user to the app settings screen
+  // to grant it manually. Safe to call repeatedly (e.g. from a button).
+  const ensureMicPermission = useCallback(async () => {
     try {
-      const initPromise = Pitchy.init(pitchyConfig);
-      if (initPromise && typeof initPromise.then === 'function') {
-        initPromise
-          .then(() => {
-            console.log('Pitchy.init() successful.');
-            setIsPitchyInitialized(true);
-          })
-          .catch((e: any) => {
-            console.error('Pitchy.init() failed (promise catch):', e);
-            setIsPitchyInitialized(false); // Explicitly set to false on error
-          });
-      } else {
-        setIsPitchyInitialized(true); // Optimistic if no promise, but check lib behavior
+      const RECORD_AUDIO = PermissionsAndroid.PERMISSIONS.RECORD_AUDIO;
+
+      // Already granted? Nothing to do.
+      if (await PermissionsAndroid.check(RECORD_AUDIO)) {
+        setHasPermission(true);
+        return;
+      }
+
+      // Ask. `request` returns GRANTED / DENIED / NEVER_ASK_AGAIN. Unlike Expo's
+      // `canAskAgain`, PermissionsAndroid signals "don't ask again" via the
+      // NEVER_ASK_AGAIN result — that's when we route the user to Settings.
+      const result = await PermissionsAndroid.request(RECORD_AUDIO);
+      if (result === PermissionsAndroid.RESULTS.GRANTED) {
+        setHasPermission(true);
+        return;
+      }
+
+      setHasPermission(false);
+      if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) {
+        Alert.alert(
+          'Microphone Access Needed',
+          'The system permission dialog can no longer be shown. Enable Microphone for this app in Settings, then return here.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings() },
+          ]
+        );
       }
     } catch (e: any) {
-      console.error('Error calling Pitchy.init() (try-catch block):', e);
-      setIsPitchyInitialized(false);
+      Alert.alert('Permission Error', 'Could not request microphone permission: ' + e.message);
     }
-    // No cleanup needed for init itself, but if it had a specific deinit, it would go here.
   }, []);
 
-  // Main audio processing effect
+  // Ask on mount, and re-check whenever the app returns to the foreground — so
+  // granting permission in Settings is picked up automatically on return.
   useEffect(() => {
+    ensureMicPermission();
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') ensureMicPermission();
+    });
+    return () => sub.remove();
+  }, [ensureMicPermission]);
+
+  // Step 2: once permission is granted, (re)initialize and start Pitchy. This
+  // re-runs whenever noiseThreshold changes, because Pitchy's noise gate
+  // (`minVolume`) is fixed at init time. Pitchy is now the ONLY microphone
+  // client — react-native-sound-level was removed to avoid two AudioSource.MIC
+  // recorders fighting over the device microphone on Android.
+  useEffect(() => {
+    if (!hasPermission) return;
+
     let isMounted = true;
     let pitchSubscription: { remove: () => void } | null = null;
 
-    // Guard: Do not proceed if Pitchy is not yet initialized.
-    if (!isPitchyInitialized) {
-      console.log('Main audio effect: Pitchy not initialized, skipping setup.');
-      return; // Wait for Pitchy to be initialized
-    }
-
     const setupAudioProcessing = async () => {
-      // Artificial delay to allow native modules to settle after potential stop from cleanup
-      await new Promise(resolve => setTimeout(resolve, 250)); 
-      if (!isMounted) {
-          // console.log("setupAudioProcessing: Unmounted during initial delay. Aborting setup.");
-          return;
-      }
-      // console.log('setupAudioProcessing: Starting audio services after delay.');
-
-      // pitchyStartedRef.current = false; // These are set after conditional stops
-      // soundLevelStartedRef.current = false;
-
       try {
-        // console.log('setupAudioProcessing: Pre-emptive stop of audio services...');
+        // Ensure any prior session (e.g. from a previous threshold) is stopped
+        // before re-initializing, so we never leak a native recorder.
         if (pitchyStartedRef.current) {
-          try {
-            const stopPitchyPromise = Pitchy.stop();
-            if (stopPitchyPromise && typeof stopPitchyPromise.then === 'function') {
-              await stopPitchyPromise;
-
-            } else {
-              // console.warn('setupAudioProcessing: Pitchy.stop() did not return a promise (pre-emptive).');
-            }
-          } catch (e:any) {
-            // console.warn('setupAudioProcessing: Error during pre-emptive Pitchy.stop() (when ref was true):', e);
-          }
-        } else {
-          // console.log('setupAudioProcessing: Pre-emptive Pitchy.stop() skipped as pitchyStartedRef was false.');
+          try { await Pitchy.stop(); } catch { /* ignore */ }
+          pitchyStartedRef.current = false;
         }
-        pitchyStartedRef.current = false; // Reset ref before new start attempt
 
-        if (soundLevelStartedRef.current) {
-          RNSoundLevel.stop();
-          // console.log('setupAudioProcessing: Pre-emptive RNSoundLevel.stop() called.');
-        } else {
-          // console.log('setupAudioProcessing: Pre-emptive RNSoundLevel.stop() skipped as soundLevelStartedRef was false.');
-        }
-        soundLevelStartedRef.current = false; // Reset ref before new start attempt
-        // console.log('setupAudioProcessing: Pre-emptive stop completed.');
-
+        // bufferSize is passed straight to AudioRecord as bytes. Pitchy's
+        // default (4096) is below the minimum buffer some devices require for
+        // 44.1kHz mono PCM16, which makes AudioRecord initialize in
+        // STATE_UNINITIALIZED and startRecording() throw. 8192 is large enough
+        // for those devices while still small enough for responsive tuning.
+        // algorithm: MPM is far less octave-error-prone than Pitchy's default
+        // ACF2+ and gives real (non-binary) confidence for the JS gate below.
+        const pitchyConfig: PitchyConfig = { minVolume: noiseThreshold, bufferSize: 8192, algorithm: PITCH_ALGORITHM };
+        await Pitchy.init(pitchyConfig);
         if (!isMounted) return;
 
-        const permissionStatus = await AudioModule.requestRecordingPermissionsAsync();
-        if (!permissionStatus.granted) {
-          if (isMounted) Alert.alert('Permission Denied', 'Microphone permission is required.');
+        await Pitchy.start();
+        pitchyStartedRef.current = true;
+
+        if (!isMounted) {
+          try { await Pitchy.stop(); } catch { /* ignore */ }
+          pitchyStartedRef.current = false;
           return;
         }
-        // console.log('setupAudioProcessing: Microphone permissions granted.');
 
-        if (!isMounted) return;
+        // Pitchy gates on volume natively; here we run each frame through the
+        // stabilization pipeline: confidence gate → octave fold + median
+        // (processPitch) → note hysteresis (pickNote). See constants above.
+        pitchSubscription = Pitchy.addListener((data) => {
+          if (!isMounted) return;
+          const pitch = data?.pitch ?? -1;
+          const confidence = data?.confidence ?? 0;
+          // tCaptureMs is the true audio-clock capture time (immune to bridge
+          // backlog); fall back to Date.now() if the native module omits it.
+          const tMs = data?.tCaptureMs ?? Date.now();
 
-        RNSoundLevel.onNewFrame = (data) => {
-          if (isMounted) {
-            const newVolume = data.value;
-            // console.log(`RNSoundLevel Frame: Volume=${newVolume.toFixed(2)}, NoiseThreshold=${noiseThresholdRef.current.toFixed(2)}`); // DEBUG LOG
-            setVolume(newVolume);
-            volumeRef.current = newVolume;
-            if (newVolume < noiseThresholdRef.current) {
-              // console.log('RNSoundLevel: Volume below threshold, clearing frequency/note.'); // DEBUG LOG
-              setCurrentFrequency(null);
-              setDetectedNote(null);
-            }
+          // Out of guitar range / unvoiced → schedule a debounced blank, don't
+          // clear instantly (that strobes between plucks and during decay).
+          if (pitch < MIN_GUITAR_FREQUENCY || pitch > MAX_GUITAR_FREQUENCY) {
+            handleSilenceRef.current();
+            return;
           }
-        };
-        RNSoundLevel.start();
-        soundLevelStartedRef.current = true;
-        // console.log('setupAudioProcessing: RNSoundLevel started.');
+          // Low-confidence frame carries no reliable pitch — keep the last held
+          // reading rather than reacting to it.
+          if (confidence < MIN_CONFIDENCE) return;
 
-        if (!isMounted) return;
-
-        try {
-          // console.log('setupAudioProcessing: Attempting Pitchy.start()...');
-          const startPromise = Pitchy.start();
-          if (startPromise && typeof startPromise.then === 'function') {
-            await startPromise;
-            // console.log('setupAudioProcessing: Pitchy.start() resolved.');
-          } else {
-            // console.warn('setupAudioProcessing: Pitchy.start() did not return a promise (assuming sync success).');
-            // If sync and fails, it should throw, to be caught by the catch block.
-          }
-          pitchyStartedRef.current = true; // Mark as started
-
-          if (!isMounted) { // Check again after await/potential sync operation
-            if (pitchyStartedRef.current) { // If we thought it started
-                try { Pitchy.stop(); } catch (e) { /* console.warn("Error stopping Pitchy due to unmount after start", e); */ }
-            }
-            pitchyStartedRef.current = false;
-            return; // Important: exit if unmounted
+          // Good frame: cancel any pending silence blank.
+          if (releaseTimerRef.current != null) {
+            clearTimeout(releaseTimerRef.current);
+            releaseTimerRef.current = null;
           }
 
-          // Add listener only after successful start and if still mounted
-          pitchSubscription = Pitchy.addListener((data) => {
-            // console.log(`Pitchy Data: Pitch=${data?.pitch?.toFixed(2)}, VolumeRef=${volumeRef.current?.toFixed(2)}, NoiseThreshold=${noiseThresholdRef.current.toFixed(2)}`); // DEBUG LOG
-            if (isMounted && volumeRef.current !== null && volumeRef.current >= noiseThresholdRef.current) {
-              if (data && data.pitch != null) {
-                if (data.pitch >= MIN_GUITAR_FREQUENCY && data.pitch <= MAX_GUITAR_FREQUENCY) {
-                  // console.log('Pitchy: Valid pitch detected and above threshold.'); // DEBUG LOG
-                  setCurrentFrequency(data.pitch);
-                  setDetectedNote(frequencyToNoteRef.current(data.pitch)); // Use ref here
-                } else {
-                  // console.log('Pitchy: Pitch out of guitar range.'); // DEBUG LOG
-                  setCurrentFrequency(null);
-                  setDetectedNote(null);
-                }
-              } 
-            } 
-          });
-          // console.log('setupAudioProcessing: Pitchy listener added AFTER Pitchy.start().');
-        
-          // if (isMounted) console.log('setupAudioProcessing: Pitch detection started successfully.');
-
-        } catch (error: any) {
-          // console.error('setupAudioProcessing: Error during Pitchy.start() or addListener():', error);
-          if (isMounted) Alert.alert('Audio Processing Error', 'Could not start Pitchy: ' + error.message);
-          
-          // Cleanup if error occurred
-          if (pitchSubscription) { // If listener was somehow assigned before error
-            pitchSubscription.remove();
-            pitchSubscription = null;
-          }
-          if (pitchyStartedRef.current) { // If start was marked true but something after failed
-            try { Pitchy.stop(); } catch (e) { /* console.warn("Error stopping Pitchy in start/addListener error handler", e); */ }
-          }
-          pitchyStartedRef.current = false;
-          
-          // Also stop RNSoundLevel if Pitchy setup fails
-          if (soundLevelStartedRef.current) {
-              RNSoundLevel.stop();
-              soundLevelStartedRef.current = false;
-          }
-          return; // Exit setupAudioProcessing
-        }
-        
+          const stable = processPitchRef.current(pitch);
+          setCurrentFrequency(stable);
+          setDetectedNote(pickNoteRef.current(stable, tMs));
+        });
       } catch (error: any) {
-        // console.error('setupAudioProcessing: Outer error - Error setting up or starting audio processing:', error);
-        if (isMounted) Alert.alert('Audio Processing Error', 'Could not start audio processing: ' + error.message);
+        if (pitchSubscription) {
+          pitchSubscription.remove();
+          pitchSubscription = null;
+        }
+        if (pitchyStartedRef.current) {
+          try { await Pitchy.stop(); } catch { /* ignore */ }
+          pitchyStartedRef.current = false;
+        }
+        if (isMounted) Alert.alert('Audio Processing Error', 'Could not start pitch detection: ' + error.message);
       }
     };
 
-    if (isMounted) {
-      setupAudioProcessing();
-    }
+    setupAudioProcessing();
 
     return () => {
       isMounted = false;
-      // console.log('Cleaning up audio processing (main effect)...');
       if (pitchSubscription) {
         pitchSubscription.remove();
         pitchSubscription = null;
-        // console.log('Pitch listener removed.');
       }
-      
       if (pitchyStartedRef.current) {
-        // console.log('Attempting to stop Pitchy in cleanup (ref was true)...');
-        try {
-          const stopPromise = Pitchy.stop();
-          if (stopPromise && typeof stopPromise.then === 'function') {
-            stopPromise
-              // .then(() => console.log('Pitchy stopped (main effect cleanup promise).'))
-              .catch((e: any) => { /* console.error('Error stopping Pitchy (main effect cleanup promise):', e) */ });
-            // Not setting pitchyStartedRef.current = false here immediately if async,
-            // as the operation is pending. It will be set below.
-          } else {
-            // console.warn('Pitchy.stop did not return a promise during main effect cleanup.');
-          }
-        } catch (e: any) {
-          // console.error('Error calling Pitchy.stop (main effect cleanup catch):', e);
-        }
-        pitchyStartedRef.current = false; // Mark as stopped or attempt to stop was made
-      } else {
-        // console.log('Pitchy.stop() skipped in cleanup (ref was false).');
+        Pitchy.stop().catch(() => { /* ignore */ });
+        pitchyStartedRef.current = false;
       }
-      
-      if (soundLevelStartedRef.current) {
-        // console.log('Attempting to stop RNSoundLevel in cleanup (ref was true)...');
-        RNSoundLevel.stop();
-        soundLevelStartedRef.current = false; // Mark as stopped
-        // console.log('RNSoundLevel stopped (main effect cleanup).');
-      } else {
-        // console.log('RNSoundLevel.stop() skipped in cleanup (ref was false).');
-      }
+      // Clear any stale reading and stabilization state when the session tears down.
+      resetPitchPipeline();
+      setCurrentFrequency(null);
+      setDetectedNote(null);
     };
-  }, [isPitchyInitialized]); // Removed frequencyToNote from dependencies
+  }, [hasPermission, noiseThreshold, resetPitchPipeline]);
 
   const onVisualizerLayout = (event: LayoutChangeEvent) => {
     const { width, height } = event.nativeEvent.layout;
     setVisualizerLayout({ width, height });
   };
 
-  // const leftNotes = [tuningNotes[2], tuningNotes[1], tuningNotes[0]]; // No longer needed
-  // const rightNotes = [tuningNotes[3], tuningNotes[4], tuningNotes[5]]; // No longer needed
+  // Tuning selection / customisation handlers
+  const handleSelectChromatic = () => {
+    setTuningStrings(null);
+    setActiveInstrumentName(null);
+    setActiveTuningName(null);
+    setTuningModalVisible(false);
+  };
+
+  const handleSelectTuning = (instrument: Instrument, tuning: Tuning) => {
+    setTuningStrings([...tuning.strings]); // working copy so edits don't mutate the preset
+    setActiveInstrumentName(instrument.name);
+    setActiveTuningName(tuning.name);
+    setTuningModalVisible(false);
+  };
+
+  const handleSelectNote = (note: string) => {
+    if (editingStringIndex === null) return;
+    setTuningStrings((prev) => {
+      if (!prev) return prev;
+      const next = [...prev];
+      next[editingStringIndex] = note;
+      return next;
+    });
+    setActiveTuningName('Custom'); // editing a string makes this a custom tuning
+    setEditingStringIndex(null);
+  };
+
+  // Headstock split: low strings on the left column, high strings on the right,
+  // each ordered top → bottom. Works for any string count (e.g. 6 → 3+3, 4 → 2+2).
+  const leftCount = tuningStrings ? Math.ceil(tuningStrings.length / 2) : 0;
+  const leftStrings = tuningStrings ? tuningStrings.slice(0, leftCount) : [];
+  const rightStrings = tuningStrings ? tuningStrings.slice(leftCount) : [];
+
+  // Render a single string button. `globalIndex` is the index into tuningStrings
+  // so tapping opens the note picker for the correct string.
+  const renderStringButton = (note: string, globalIndex: number) => {
+    const isActive = detectedNote === note;
+    return (
+      <Pressable
+        key={`${note}-${globalIndex}`}
+        style={[styles.stringButton, isActive && styles.stringButtonActive]}
+        onPress={() => setEditingStringIndex(globalIndex)}
+      >
+        <Text style={[styles.stringButtonText, isActive && styles.stringButtonTextActive]}>
+          {note}
+        </Text>
+      </Pressable>
+    );
+  };
 
   return (
     <SafeAreaView style={styles.container}>
+
+      {/* Tuning Button - top left */}
+      <View style={styles.headerControlsLeft}>
+        <Pressable onPress={() => setTuningModalVisible(true)} style={styles.settingsButton}>
+          <Text style={styles.settingsButtonText}>Tuning</Text>
+        </Pressable>
+      </View>
 
       {/* Settings Button - Placed at top right or a dedicated settings area */}
       <View style={styles.headerControls}>
@@ -381,6 +586,15 @@ export default function App() {
       </View>
 
       <View style={styles.mainContent}>
+        {/* Microphone permission prompt - shown until access is granted */}
+        {!hasPermission && (
+          <Pressable style={styles.permissionBanner} onPress={ensureMicPermission}>
+            <Text style={styles.permissionBannerText}>
+              Microphone access needed — tap to enable
+            </Text>
+          </Pressable>
+        )}
+
         {/* Frequency Display Area (Visualizer + Frequency Value + Detected Note) */}
         <View style={styles.frequencyDisplayContainer}>
           {/* Detected Note - Top Center of this container */}
@@ -388,20 +602,38 @@ export default function App() {
             <Text style={styles.detectedNoteText}>{detectedNote !== null ? detectedNote : '--'}</Text>
           </View>
 
-          {/* This View is a placeholder for the actual frequency visualization */}
-          <View style={styles.visualizerAreaContainer} onLayout={onVisualizerLayout}>
-            {visualizerLayout && (
-              <FrequencyVisualizer
-                width={visualizerLayout.width}
-                height={visualizerLayout.height}
-                currentFrequency={currentFrequency}
-                targetFrequency={targetFrequency}
-                currentVolume={volume}
-                visualizerSensitivity={visualizerSensitivity} // Pass sensitivity here
-              />
+          {/* Visualizer, flanked by string buttons (headstock layout) when a
+              tuning is active. In Chromatic mode the columns are absent and the
+              visualizer fills the width, exactly as before. */}
+          <View style={styles.visualizerRow}>
+            {tuningStrings && (
+              <View style={styles.stringColumn}>
+                {leftStrings.map((note, i) => renderStringButton(note, i))}
+              </View>
             )}
-            {!visualizerLayout && (
-              <Text style={styles.visualizerPlaceholderText}>Visualizer Area Loading...</Text>
+
+            <View style={styles.visualizerAreaContainer} onLayout={onVisualizerLayout}>
+              {visualizerLayout && (
+                <FrequencyVisualizer
+                  width={visualizerLayout.width}
+                  height={visualizerLayout.height}
+                  currentFrequency={currentFrequency}
+                  targetFrequency={targetFrequency}
+                  // Pitchy gates on volume natively; a detected frequency means we
+                  // are above the noise floor, so the visualizer is always "audible".
+                  currentVolume={0}
+                  visualizerSensitivity={visualizerSensitivity} // Pass sensitivity here
+                />
+              )}
+              {!visualizerLayout && (
+                <Text style={styles.visualizerPlaceholderText}>Visualizer Area Loading...</Text>
+              )}
+            </View>
+
+            {tuningStrings && (
+              <View style={styles.stringColumn}>
+                {rightStrings.map((note, i) => renderStringButton(note, leftCount + i))}
+              </View>
             )}
           </View>
           
@@ -431,6 +663,41 @@ export default function App() {
           onClose={() => setSettingsModalVisible(false)}
         />
       </Modal>
+
+      {/* Instrument / tuning picker */}
+      <Modal
+        animationType="slide"
+        transparent={false}
+        visible={tuningModalVisible}
+        onRequestClose={() => setTuningModalVisible(false)}
+      >
+        <TuningSelector
+          instruments={INSTRUMENTS}
+          activeInstrumentName={activeInstrumentName}
+          activeTuningName={activeTuningName}
+          onSelectChromatic={handleSelectChromatic}
+          onSelectTuning={handleSelectTuning}
+          onClose={() => setTuningModalVisible(false)}
+        />
+      </Modal>
+
+      {/* Per-string note customisation */}
+      <Modal
+        animationType="slide"
+        transparent={false}
+        visible={editingStringIndex !== null}
+        onRequestClose={() => setEditingStringIndex(null)}
+      >
+        {editingStringIndex !== null && tuningStrings && (
+          <NotePicker
+            notes={ALL_NOTE_NAMES}
+            currentNote={tuningStrings[editingStringIndex]}
+            stringLabel={`String ${editingStringIndex + 1}`}
+            onSelect={handleSelectNote}
+            onClose={() => setEditingStringIndex(null)}
+          />
+        )}
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -441,10 +708,16 @@ const styles = StyleSheet.create({
     backgroundColor: '#0D0D0D', // Darker, terminal-like background
   },
   headerControls: {
-    position: 'absolute', 
-    top: Platform.OS === 'android' ? 25 : 40, 
+    position: 'absolute',
+    top: Platform.OS === 'android' ? 25 : 40,
     right: 15, // Position the container from the right edge
-    zIndex: 10, 
+    zIndex: 10,
+  },
+  headerControlsLeft: {
+    position: 'absolute',
+    top: Platform.OS === 'android' ? 25 : 40,
+    left: 15, // Mirror of headerControls, on the left edge
+    zIndex: 10,
   },
   settingsButton: {
     padding: 45, // Increased padding for a larger, more reliable touch target
@@ -460,8 +733,22 @@ const styles = StyleSheet.create({
     paddingTop: Platform.OS === 'ios' ? 90 : 80,
     paddingBottom:  Platform.OS === 'android' ? 20 : 40,
   },
+  permissionBanner: {
+    borderWidth: 1,
+    borderColor: NEON_GREEN,
+    borderRadius: 5,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  permissionBannerText: {
+    fontSize: 14,
+    color: NEON_GREEN,
+    textAlign: 'center',
+  },
   detectedNoteContainer: {
-    paddingVertical: 5, 
+    paddingVertical: 5,
     alignSelf: 'center',
   },
   detectedNoteText: {
@@ -483,12 +770,42 @@ const styles = StyleSheet.create({
     paddingBottom: 40, // Adjusted from 100
     paddingHorizontal: 10,
   },
-  visualizerAreaContainer: { 
+  visualizerRow: {
     flex: 1,
     width: '100%',
+    flexDirection: 'row',
+    alignItems: 'stretch',
+  },
+  visualizerAreaContainer: {
+    flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
- 
+  },
+  stringColumn: {
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+  },
+  stringButton: {
+    borderWidth: 1,
+    borderColor: '#003300',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    minWidth: 52,
+    alignItems: 'center',
+  },
+  stringButtonActive: {
+    borderColor: NEON_GREEN,
+    backgroundColor: 'rgba(57,255,20,0.12)',
+  },
+  stringButtonText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#2AAA8A', // dim green when not the active string
+  },
+  stringButtonTextActive: {
+    color: NEON_GREEN,
   },
   visualizerPlaceholderText: {
     fontSize: 16,

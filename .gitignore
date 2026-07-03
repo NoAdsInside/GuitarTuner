@@ -3,11 +3,8 @@
 # dependencies
 node_modules/
 
-# Expo
-.expo/
+# Metro / bundler output
 dist/
-web-build/
-expo-env.d.ts
 
 # Native
 .kotlin/
@@ -30,6 +27,9 @@ yarn-error.*
 .DS_Store
 *.pem
 
+# IDE
+.idea/
+
 # local env files
 .env*.local
 
@@ -37,3 +37,5 @@ yarn-error.*
 *.tsbuildinfo
 
 app-example
+
+guitartunerchromatic-930fdb70f251.json
