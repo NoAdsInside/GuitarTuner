@@ -15,6 +15,15 @@ dist/
 *.key
 *.mobileprovision
 
+# Android signing — upload keystore & EAS credential exports (NEVER commit)
+*.keystore
+!android/app/debug.keystore
+*keystore-credentials*
+*-keystore.bak.*
+
+# Personal, machine-local notes/guides
+*.local.md
+
 # Metro
 .metro-health-check*
 
