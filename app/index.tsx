@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { View, StyleSheet, Alert, Text, Platform, LayoutChangeEvent, SafeAreaView, Modal, Pressable, Linking, AppState, PermissionsAndroid } from 'react-native';
+import { View, StyleSheet, Alert, Text, LayoutChangeEvent, StatusBar, Modal, Pressable, Linking, AppState, PermissionsAndroid } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Pitchy, { PitchyConfig } from 'react-native-pitchy';
 import FrequencyVisualizer from './FrequencyVisualizer'; // Import the new component
 import SettingsScreen from './SettingsScreen'; // Import SettingsScreen
@@ -118,6 +119,11 @@ const ALL_NOTE_NAMES: string[] = getStandardNoteFrequencies()
   .map((n) => n.noteNameWithOctave);
 
 export default function App() {
+  // Safe-area insets — with Android 16's mandatory edge-to-edge display the app
+  // draws behind the system bars, so header controls and content padding are
+  // offset by these instead of the old hardcoded Platform constants.
+  const insets = useSafeAreaInsets();
+
   const [currentFrequency, setCurrentFrequency] = useState<number | null>(null);
   const [detectedNote, setDetectedNote] = useState<string | null>(null);
   const [targetFrequency, setTargetFrequency] = useState<number | null>(null); // For the visualizer
@@ -569,23 +575,27 @@ export default function App() {
   };
 
   return (
-    <SafeAreaView style={styles.container}>
+    <View style={styles.container}>
+      {/* Android 16 (API 36) forces edge-to-edge: the app paints behind the
+          status/navigation bars, so keep the status-bar icons light against the
+          black background and drive all offsets from real safe-area insets below. */}
+      <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
 
       {/* Tuning Button - top left */}
-      <View style={styles.headerControlsLeft}>
+      <View style={[styles.headerControlsLeft, { top: insets.top + 25 }]}>
         <Pressable onPress={() => setTuningModalVisible(true)} style={styles.settingsButton}>
           <Text style={styles.settingsButtonText}>Tuning</Text>
         </Pressable>
       </View>
 
       {/* Settings Button - Placed at top right or a dedicated settings area */}
-      <View style={styles.headerControls}>
+      <View style={[styles.headerControls, { top: insets.top + 25 }]}>
         <Pressable onPress={() => setSettingsModalVisible(true)} style={styles.settingsButton}>
           <Text style={styles.settingsButtonText}>Settings</Text>
         </Pressable>
       </View>
 
-      <View style={styles.mainContent}>
+      <View style={[styles.mainContent, { paddingTop: insets.top + 80, paddingBottom: insets.bottom + 20 }]}>
         {/* Microphone permission prompt - shown until access is granted */}
         {!hasPermission && (
           <Pressable style={styles.permissionBanner} onPress={ensureMicPermission}>
@@ -698,7 +708,7 @@ export default function App() {
           />
         )}
       </Modal>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -709,13 +719,13 @@ const styles = StyleSheet.create({
   },
   headerControls: {
     position: 'absolute',
-    top: Platform.OS === 'android' ? 25 : 40,
+    // `top` is applied inline as insets.top + 25 (edge-to-edge safe area).
     right: 15, // Position the container from the right edge
     zIndex: 10,
   },
   headerControlsLeft: {
     position: 'absolute',
-    top: Platform.OS === 'android' ? 25 : 40,
+    // `top` is applied inline as insets.top + 25 (edge-to-edge safe area).
     left: 15, // Mirror of headerControls, on the left edge
     zIndex: 10,
   },
@@ -729,9 +739,9 @@ const styles = StyleSheet.create({
   mainContent: {
     flex: 1,
     position: 'relative',
-    paddingHorizontal: 20, 
-    paddingTop: Platform.OS === 'ios' ? 90 : 80,
-    paddingBottom:  Platform.OS === 'android' ? 20 : 40,
+    paddingHorizontal: 20,
+    // paddingTop/paddingBottom are applied inline from safe-area insets
+    // (insets.top + 80 / insets.bottom + 20) for edge-to-edge layout.
   },
   permissionBanner: {
     borderWidth: 1,

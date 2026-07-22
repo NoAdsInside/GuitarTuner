@@ -32,16 +32,16 @@ There is no test suite or test runner configured.
 
 ### Native build notes / gotchas
 
-- **Version pins come from React Native 0.79**: Gradle 8.13 (wrapper), AGP 8.8.2 and Kotlin 2.0.21 (from `@react-native/gradle-plugin`'s version catalog). Do **not** bump to Gradle 9 — AGP 8.8.2 requires Gradle 8.x. The clean way to move these is a React Native upgrade.
+- **Version pins come from React Native 0.86**: Gradle 9.3.1 (wrapper), AGP 8.12.0 and Kotlin 2.1.20 (from `@react-native/gradle-plugin`'s version catalog). The app targets **Android 16 / API 36** (`compileSdk`/`targetSdk = 36`, `buildToolsVersion 36.0.0`) to satisfy Google Play's target-API requirement. The clean way to move any of these versions is a React Native upgrade — the 0.79→0.86 upgrade is what brought API 36 support plus the AGP 8.9.1+ that `compileSdk 36` requires (AGP 8.8.2 on RN 0.79 could not compile against 36, which is why the bump was done as a full RN upgrade rather than hand-editing AGP/Gradle).
 - `android/settings.gradle` must include `@react-native/gradle-plugin` in **both** `pluginManagement { includeBuild(...) }` **and** a top-level `includeBuild(...)`; the top-level one supplies the versionless `classpath(...)` plugin versions transitively. Dropping it → `Could not find ...:.` failures. `android/build.gradle` also declares the `ext { …SdkVersion, ndkVersion, kotlinVersion }` block that Expo's root plugin used to provide.
-- Our Gradle files use the modern `propName = value` assignment syntax. Any remaining "Deprecated Gradle features / incompatible with Gradle 9.0" warnings come from third-party libs' `build.gradle` under `node_modules` (pitchy, slider, svg, safe-area-context) — not editable by us, benign, resolved when those libs update.
+- Our Gradle files use the modern `propName = value` assignment syntax. Any remaining Gradle 9 deprecation warnings come from third-party libs' `build.gradle` under `node_modules` (pitchy, slider, svg, safe-area-context) — not editable by us, benign, resolved when those libs update.
 
 ## Architecture
 
 The app is a single screen. The root entry is **`index.js`** at the project root, which registers the `main` component (wrapped in `SafeAreaProvider`) via `AppRegistry`. The screen and its components live in `app/` (a plain directory now — no Expo Router).
 
 - **`index.js`** (project root) — RN entry point; `AppRegistry.registerComponent('main', …)`, wraps `App` in `SafeAreaProvider`.
-- **`app/index.tsx`** — the single screen and the heart of the app. Default-exported as `App`. Owns all audio lifecycle and state. Renders the visualizer and a settings `Modal`.
+- **`app/index.tsx`** — the single screen and the heart of the app. Default-exported as `App`. Owns all audio lifecycle and state. Renders the visualizer and a settings `Modal`. Runs **edge-to-edge** (mandatory when targeting Android 16): the root is a plain `View`, and the header controls' `top` and `mainContent`'s vertical padding are offset by `useSafeAreaInsets()` (react-native-safe-area-context) instead of the old hardcoded `Platform` constants, so nothing is clipped by the status/gesture bars. The full-screen modal components use safe-area-context's native `SafeAreaView`, which measures insets correctly even inside a RN `Modal`.
 - **`app/FrequencyVisualizer.tsx`** — pure presentational SVG component. Animated indicator dot + falling "tail" trail. No audio logic.
 - **`app/SettingsScreen.tsx`** — controlled component (props only, no own state) with two sliders, shown inside the modal in `index.tsx`.
 

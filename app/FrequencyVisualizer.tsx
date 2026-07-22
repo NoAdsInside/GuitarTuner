@@ -74,6 +74,7 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
   const [isSettling, setIsSettling] = useState(false);
   const settlingTimerRef = useRef<number | null>(null);
   const smoothedFrequencyRef = useRef<number | null>(null);
+  const prevTargetFrequencyRef = useRef<number | null>(null);
 
   // Resets indicator position and state when width changes (e.g., on orientation change).
   useEffect(() => {
@@ -155,13 +156,25 @@ const FrequencyVisualizer: React.FC<FrequencyVisualizerProps> = ({
     wasPreviouslyVisible.current = nextIndicatorVisibleState;
     isIndicatorCurrentlyVisible.current = nextIndicatorVisibleState && !isSettling;
 
+    // A change in targetFrequency means the detected note switched. The EMA
+    // history belongs to the PREVIOUS note, so restart it fresh — otherwise the
+    // old pitch drags the dot off-center for ~a dozen-plus frames while the EMA
+    // converges, making an in-tune new string read flat for seconds. Nulling
+    // here lets the seed branch below re-seed from the current raw frequency, so
+    // the dot snaps to the correct spot on the first frame after the switch.
+    if (targetFrequency !== prevTargetFrequencyRef.current) {
+      prevTargetFrequencyRef.current = targetFrequency;
+      smoothedFrequencyRef.current = null;
+    }
+
     let frequencyToUseForVisuals: number | null = null;
     if (currentFrequency !== null) {
       if (smoothedFrequencyRef.current === null) {
-        // No prior smoothed value (first frame after true silence): seed with the
-        // current frequency. We deliberately do NOT reseed across the settling
-        // transition — the upstream pipeline already delivers a stable stream, so
-        // keeping the EMA history here avoids a visible jump when settling ends.
+        // No prior smoothed value (first frame after true silence, or just after a
+        // note change reset above): seed with the current frequency. Within a note
+        // we deliberately do NOT reseed across the settling transition — the
+        // upstream pipeline already delivers a stable stream, so keeping the EMA
+        // history there avoids a visible jump when settling ends.
         smoothedFrequencyRef.current = currentFrequency;
       } else {
         smoothedFrequencyRef.current =

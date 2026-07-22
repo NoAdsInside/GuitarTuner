@@ -4,13 +4,14 @@ buildscript {
   ext {
     // These were previously supplied by the Expo `expo-root-project` gradle plugin.
     // With Expo removed they must be declared here for app/build.gradle to read via
-    // rootProject.ext.*. Values match the React Native 0.79 template defaults.
-    buildToolsVersion = "35.0.0"
+    // rootProject.ext.*. Values match the React Native 0.86 template defaults
+    // (compile/target SDK 36 for the Android 16 Play Store requirement).
+    buildToolsVersion = "36.0.0"
     minSdkVersion = 24
-    compileSdkVersion = 35
-    targetSdkVersion = 35
+    compileSdkVersion = 36
+    targetSdkVersion = 36
     ndkVersion = "27.1.12297006"
-    kotlinVersion = "2.0.21"
+    kotlinVersion = "2.1.20"
   }
   repositories {
     google()

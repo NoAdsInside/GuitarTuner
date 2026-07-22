@@ -6,6 +6,10 @@
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
   <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+  <!-- RECORD_AUDIO makes Play imply android.hardware.microphone as REQUIRED by default,
+       which excludes every mic-less device model from the Play catalog. The tuner checks
+       for the mic at runtime, so declare it optional to keep those devices supported. -->
+  <uses-feature android:name="android.hardware.microphone" android:required="false"/>
   <queries>
     <intent>
       <action android:name="android.intent.action.VIEW"/>

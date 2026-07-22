@@ -13,7 +13,7 @@ A mobile application built with **bare React Native** (Android) that provides a 
 
 ## Tech Stack
 
-*   **React Native** (0.79, New Architecture): Bare workflow, Android-only. Builds are fully local via Gradle — no Expo and no cloud build service.
+*   **React Native** (0.86, New Architecture): Bare workflow, Android-only, targeting **Android 16 / API 36** (mandatory edge-to-edge display). Builds are fully local via Gradle — no Expo and no cloud build service.
 *   **TypeScript**: For static typing and improved code quality.
 *   **PermissionsAndroid** (core React Native): For microphone recording permission.
 *   **react-native-pitchy**: Native (Kotlin/C++) real-time pitch detection — the sole microphone client.
@@ -66,7 +66,7 @@ Follow these instructions to get the project running on your local machine for d
 npm run lint                             # eslint .
 npx tsc --noEmit                         # TypeScript typecheck
 cd android && ./gradlew assembleDebug    # build a debug APK locally
-cd android && ./gradlew bundleRelease    # build a release .aab (sign with a real keystore before publishing)
+cd android && ./gradlew assembleRelease  # build a standalone release APK (runs without Metro)
 ```
 
 There is no test suite configured.
@@ -116,11 +116,7 @@ adb shell monkey -p com.cptvitruvian.guitarTuner 1
 
 ### Signing note
 
-By default the `release` build is signed with the **debug keystore** (see `android/app/build.gradle`). That is fine for personal use and sideloading, but it is **not** acceptable for the Google Play Store, and updates only install over an existing copy if the signature matches. To distribute properly, generate your own release keystore, wire it into a `release` `signingConfig`, and build a signed app bundle:
-
-```bash
-cd android && ./gradlew bundleRelease    # -> app/build/outputs/bundle/release/app-release.aab
-```
+The `release` build is signed with the **debug keystore** by default (see `android/app/build.gradle`), which is all you need for local testing and sideloading onto your own device. If you want to distribute the app more widely, sign it with your own release keystore in whatever way suits you — that's outside the scope of this README.
 
 ## Project Structure
 
